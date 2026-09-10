@@ -31,7 +31,10 @@ Three distinct kinds of principal, modeled as one `User` table with a `type` dis
 
 **Customers never have administrative permissions, structurally, not just by configuration.** Customer authorization (`requireCustomer()`) and staff authorization (`requirePermission()`) are separate guard functions with no shared code path. There is no permission flag that, if misconfigured, could grant a customer admin capability — the customer request path never evaluates `Role`/`Permission` at all.
 
-> **Naming note:** "Membership" appears in this spec with three distinct meanings, disambiguated as: `Membership` — a staff member's access grant (org/branch/role) for RBAC; `Subscription` — the club's own paid plan with EquestrianLoop; `MembershipPlan` / `CustomerMembership` — a plan the *club* sells to *its own customers* (e.g. "Gold: 8 sessions/month"), introduced in §10. They are unrelated domains that happen to share a word.
+> **Naming note — three unrelated "membership" concepts, kept separate in both schema and authorization logic, never conflated:**
+> 1. **`Subscription`** — the *club's* paid subscription to EquestrianLoop (§6).
+> 2. **`Membership`** — a *staff* user's access grant (org/branch/role) for RBAC (§5).
+> 3. **`MembershipPlan` / `CustomerMembership`** — a plan the *club* sells to *its own customers* (e.g. "Gold: 8 sessions/month"), detailed in §10. `CustomerMembership` carries zero RBAC weight — it can restrict or extend a customer's *booking* privileges (§10) but can never grant any staff/admin permission; that grant path only exists via `Membership`/`Role`/`Permission` and customers are structurally excluded from it (§3 above).
 
 ## 4. Authentication Strategy
 
@@ -48,7 +51,7 @@ Real `Role` / `Permission` / `RolePermission` tables, not hardcoded enums, so cu
 
 - Per-organization roles: `OWNER`, `ADMIN`, `MANAGER`, `TRAINER`, `FRONT_DESK`.
 - Platform role: `SUPER_ADMIN` (no `organizationId`).
-- Permission catalog (strings): `customers.manage`, `horses.manage`, `staff.manage`, `services.manage`, `bookings.manage`, `sessions.manage`, `checkins.manage`, `loyalty.manage`, `rewards.manage`, `billing.manage`, `reports.view`, `settings.manage`.
+- Permission catalog (strings): `customers.manage`, `horses.manage`, `staff.manage`, `services.manage`, `bookings.manage`, `sessions.manage`, `checkins.manage`, `loyalty.manage`, `rewards.manage`, `memberships.manage`, `billing.manage`, `reports.view`, `settings.manage`.
 
 Foundation: one role per user per organization (`Membership` unique on `(userId, organizationId)`). Branch-level permission scoping (`Membership.branchId`) is modeled in the schema now but not enforced in UI until a later phase.
 
@@ -142,6 +145,10 @@ One `AvailabilityService` interface serves both; slot generation differs underne
 
 **Booking limits & membership restrictions.** `Service.maxBookingsPerCustomerPerWeek` (nullable — null means no limit) caps how many active bookings of that service a customer can hold; usage is computed by counting the customer's `Booking` rows in the relevant window, not a separate usage-counter table, to avoid overbuilding. `CustomerMembership` (a customer's enrollment in a `MembershipPlan`, e.g. "Gold: 8 sessions/month") can further restrict or extend this — the exact interaction (plan quota vs. per-service cap) is enforced by `BookingService` at write time, alongside the availability check.
 
+**Membership plans (`MembershipPlan` / `CustomerMembership`).** A club can define multiple `MembershipPlan` records (e.g. "Gold," "Silver," pay-per-ride has no plan at all); a customer may hold **only one active `CustomerMembership` at a time** — an intentional MVP limitation, enforced at the database with a partial unique index (`UNIQUE (organizationId, customerId) WHERE status = 'ACTIVE'`), the same "DB enforces the invariant, not caller discipline" pattern used for loyalty idempotency (§8) and booking races above. `server/membership/MembershipService.ts` is the sole entry point for activating a membership; attempting to activate a second one while one is already active fails the constraint and surfaces as a clear "customer already has an active membership" error rather than silently succeeding or double-activating. Expired/canceled `CustomerMembership` rows are never deleted — they remain for history and reporting.
+
+A plan's `allowedServices` / `allowedBranches` (empty = unrestricted, applies everywhere) narrow which `Service`/`Branch` combinations get its benefits (discount, loyalty bonus, self-booking eligibility, booking quota). Precedence for self-booking is strictly narrowing, never widening: effective self-booking eligibility = `Organization.customerSelfBookingEnabled` AND `Service.customerBookingEnabled` AND (customer has no active membership OR their plan's `allowsSelfBooking` is true) — a plan can take away self-booking for a customer it applies to, but a plan can never turn self-booking on for a club/service that has it switched off. `bookingPriorityWeight` is captured on `MembershipPlan` now (architecture-ready) but nothing reads it yet — it exists so a future waitlist/priority-access feature doesn't require a schema change, not because Phase 0 implements prioritization.
+
 **Cancellation & rescheduling.** `Service.cancellationAllowed` / `cancellationCutoffMinutes` and `reschedulingAllowed` / `reschedulingCutoffMinutes` define the policy — shown to the customer before they confirm a booking, and enforced server-side when they later try to cancel/reschedule (`now < session.startsAt - cutoffMinutes`). Rescheduling updates the existing `Booking`'s `ridingSessionId` (creating a new `RidingSession` for `DYNAMIC` services) rather than creating a new booking row; the change is recorded in `AuditLog`.
 
 **Customer isolation.** Customer-facing booking Server Actions add a third isolation layer on top of platform and tenant isolation: every read/write is additionally scoped to `booking.customerId === session.customerId`. A customer can never fetch, cancel, or reschedule another customer's booking, even within the same organization.
@@ -187,10 +194,12 @@ Path: `/[orgSlug]/portal/...`, fully separate layout from the staff dashboard, m
 - `Service` — id, organizationId, name, description, durationMinutes, capacity, price, currency, `customerBookingEnabled` (boolean, default false), schedulingType, requiresTrainer, trainerSelectable, requiresHorse, horseSelectable, requiresPaymentAtBooking, maxBookingsPerCustomerPerWeek (nullable), cancellationAllowed, cancellationCutoffMinutes (nullable), reschedulingAllowed, reschedulingCutoffMinutes (nullable), isActive
 - `BlockedTime` — id, organizationId, scope, branchId/trainerId/horseId (nullable, per scope), startsAt, endsAt, reason
 - `RidingSession` — id, organizationId, branchId, serviceId, trainerId (nullable), horseId (nullable), startsAt, endsAt, capacity, status
-- `Booking` — id, organizationId, customerId, ridingSessionId, status, createdVia, paymentId (nullable)
+- `Booking` — id, organizationId, customerId, ridingSessionId, status, createdVia, paymentId (nullable), customerMembershipId (nullable — the active membership a benefit/quota was applied under, if any; usage/remaining-sessions is derived by counting non-canceled `Booking`s against this field rather than a separately incremented counter, same ledger-over-counter approach as loyalty)
 - `CheckIn` — id, organizationId, bookingId (unique), method, checkedInAt, checkedInByStaffId
-- `MembershipPlan` — id, organizationId, name, description, price, includedSessionsPerPeriod (nullable), periodLength (nullable), isActive — a plan the *club* sells to *its customers* (distinct from platform `Subscription` and staff `Membership`, see §3 naming note)
-- `CustomerMembership` — id, organizationId, customerId, membershipPlanId, startedAt, status
+- `MembershipPlan` — id, organizationId, name, description, price, durationValue, durationUnit (`MembershipPeriod`), maxSessions (nullable — null means unlimited), discountPercentage (nullable), loyaltyBonusMultiplier (nullable, default 1.0), allowsSelfBooking (boolean, default true), bookingPriorityWeight (int, default 0 — architecture-ready, unread by any Phase 0 logic), isActive — a plan the *club* sells to *its customers* (distinct from platform `Subscription` and staff `Membership`, see §3 naming note)
+- `MembershipPlanService` — membershipPlanId, serviceId (join table; no rows for a plan = unrestricted, applies to all services)
+- `MembershipPlanBranch` — membershipPlanId, branchId (join table; no rows for a plan = unrestricted, applies to all branches)
+- `CustomerMembership` — id, organizationId, customerId, membershipPlanId, startDate, endDate (derived from plan duration at activation), status, paymentId (nullable), createdAt, updatedAt — unique partial index on `(organizationId, customerId) WHERE status = 'ACTIVE'` (see §10)
 - `LoyaltyAccount` — id, organizationId, customerId (unique), balance
 - `LoyaltyTransaction` — id, organizationId, loyaltyAccountId, type, points, sourceType, sourceId — unique(organizationId, sourceType, sourceId) where sourceId is not null
 - `Reward` — id, organizationId, name, description, pointsCost, isActive
@@ -235,6 +244,7 @@ Not built yet, deliberately: a custom-role builder, branch-level permission enfo
       /checkin                     # CheckInService
       /availability                # AvailabilityService — getAvailableSlots(), shared by portal + staff UI
       /booking                     # BookingService — createBooking(), reschedule(), cancel()
+      /membership                  # MembershipService — activateMembership(), enforces one-active-per-customer
     /db                            # Prisma client singleton, tenant-scoped query helpers
     /lib  /types  /hooks
     /config                        # site.ts, plans.ts, permissions.ts
@@ -280,8 +290,8 @@ UI is part of the definition of done for every phase — foundation-phase screen
 
 - One active `Subscription` per organization (no multi-plan/add-on platform billing) for foundation.
 - One `Role` per user per organization; branch-level scoping modeled but not enforced until Phase 8.
-- One active `CustomerMembership` per customer for foundation (no stacking multiple plans).
-- `MembershipPlan` management UI is Phase 8, though its schema exists from Phase 0.
+- Only one active `CustomerMembership` per customer, enforced by a DB partial unique index — a deliberate MVP limitation (confirmed), not an oversight; historical/expired memberships are retained, never deleted.
+- `MembershipPlan` management UI is Phase 8, though its schema (including `allowedServices`/`allowedBranches`/`bookingPriorityWeight`) exists from Phase 0.
 - The exact DB mechanism for closing booking race conditions (Postgres `EXCLUDE USING gist` on a range type vs. transactional row-locking) is an implementation-time decision, not fixed here.
 - Email/SMS provider for invites and notifications not yet chosen (candidate: Resend for email).
 - Background job scheduler not yet chosen (candidate: Inngest or trigger.dev).
