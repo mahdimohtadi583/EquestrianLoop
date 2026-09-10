@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Shared-schema multi-tenancy: every tenant-scoped table carries `organizationId`; never trust a tenant/customer identifier from client input (spec §2).
-- Two independent isolation layers on every tenant query: application-layer filter + Postgres RLS keyed on a server-set `app.current_tenant_id` session variable (spec §2).
+- Two independent isolation layers on every tenant query, and both are consistently exercised, not merely available: an explicit `where: { organizationId }` filter on every tenant-scoped query, *and* that query running inside `withTenantContext()` so Postgres RLS is keyed on a server-set `app.current_tenant_id` session variable (spec §2). This is enforced structurally (Task 2's `prisma`/`rawPrisma` split) — direct access to a tenant-scoped model outside `withTenantContext` is a thrown error, not a missed convention.
 - `User.type` (`SUPER_ADMIN | STAFF | CUSTOMER`) — customer and staff authorization are separate guard functions with no shared code path; customers can never reach an RBAC permission check (spec §3).
 - No `TRIALING` value anywhere in `SubscriptionStatus` — paid-only is structural, not configured (spec §6).
 - Billing and storage are accessed only through `PaymentProvider`/`StorageProvider` interfaces — no Stripe or Supabase SDK types outside their provider implementation files (spec §6, §7).
@@ -66,6 +66,7 @@
   /server/storage/StorageProvider.ts
   /server/storage/StorageService.ts
   /server/storage/providers/SupabaseStorageProvider.ts
+  /db/raw-client.ts
   /db/client.ts
   /config/site.ts
   /config/permissions.ts
@@ -156,15 +157,19 @@ git commit -m "Scaffold Next.js app with Tailwind, shadcn/ui, Prisma, Vitest"
 
 ---
 
-## Task 2: Prisma Setup & Platform-Level Schema
+## Task 2: Prisma Setup, Platform-Level Schema, and the Tenant-Access Boundary
+
+> **Architecture note — why this task is bigger than "add a Prisma client":** the spec (and a later review) require that tenant-scoped tables are *never* reachable except through the RLS-context-setting path (Task 9's `withTenantContext`) — not as a convention, as a fact enforced by both the type checker and the runtime. To make that true from the very first task that touches the database (rather than retrofitting it after several tasks have already written the wrong pattern), this task splits Prisma access into two objects: `rawPrisma` (the real, full-access client — imported only by `src/db/client.ts` itself and by `src/server/tenant/context.ts` in Task 9) and `prisma` (a `Proxy`-wrapped, deliberately narrow client that only exposes the four platform-level models — `user`, `organization`, `subscription`, `auditLog` — plus `$connect`/`$disconnect`). Every other property access on `prisma`, including `$transaction` and any raw-SQL escape hatch, throws immediately. There is no code path where forgetting to use `withTenantContext` silently succeeds unscoped — it fails loudly, at the first line that tries.
 
 **Files:**
 - Create: `prisma/schema.prisma`
+- Create: `src/db/raw-client.ts`
 - Create: `src/db/client.ts`
 - Test: `tests/db/platform-schema.test.ts`
+- Test: `tests/db/tenant-access-boundary.test.ts`
 
 **Interfaces:**
-- Produces: `prisma` singleton export from `src/db/client.ts` — `import { prisma } from '@/db/client'`; models `User`, `Organization`, `Branch`, `Subscription`, `AuditLog`; enums `UserType`, `SubscriptionStatus`.
+- Produces: `rawPrisma` (full client, internal-use-only export from `src/db/raw-client.ts` — imported by `src/db/client.ts` and, starting Task 9, `src/server/tenant/context.ts`; also imported directly by schema-verification tests and `prisma/seed.ts`, which sit outside the request-handling application layer this boundary protects); `prisma` (the restricted, Proxy-guarded client from `src/db/client.ts` — `import { prisma } from '@/db/client'`, the only DB import any application code under `src/app` or `src/server` may use for `user`/`organization`/`subscription`/`auditLog`); `TenantScopedModelAccessError`; models `User`, `Organization`, `Branch`, `Subscription`, `AuditLog`; enums `UserType`, `SubscriptionStatus`.
 - Consumes: `DATABASE_URL` / `DIRECT_URL` env vars (from Task 1's `.env.example`).
 
 - [ ] **Step 1: Write `prisma/schema.prisma` platform-level models**
@@ -260,29 +265,75 @@ model AuditLog {
 }
 ```
 
-- [ ] **Step 2: Create the Prisma client singleton**
+- [ ] **Step 2: Create the internal, full-access Prisma client**
 
-`src/db/client.ts`:
+`src/db/raw-client.ts`:
 ```typescript
+// INTERNAL ONLY. Do not import this file from anywhere under src/app or
+// src/server except src/server/tenant/context.ts (Task 9). Every other
+// consumer of the database — pages, Server Actions, RBAC guards — must
+// import `prisma` from '@/db/client' (platform models only) or use
+// withTenantContext() from '@/server/tenant/context' (tenant-scoped models,
+// RLS-enforced). Schema-verification tests and prisma/seed.ts are the only
+// other sanctioned importers, since they sit outside the request-handling
+// application layer this split protects.
 import { PrismaClient } from '@prisma/client'
 
-const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient }
+const globalForPrisma = globalThis as unknown as { rawPrisma?: PrismaClient }
 
-export const prisma = globalForPrisma.prisma ?? new PrismaClient()
+export const rawPrisma = globalForPrisma.rawPrisma ?? new PrismaClient()
 
 if (process.env.NODE_ENV !== 'production') {
-  globalForPrisma.prisma = prisma
+  globalForPrisma.rawPrisma = rawPrisma
 }
 ```
 
-- [ ] **Step 3: Run the initial migration**
+- [ ] **Step 3: Create the restricted, Proxy-guarded client application code actually imports**
+
+`src/db/client.ts`:
+```typescript
+import { rawPrisma } from './raw-client'
+
+// `permission` is included here even though it isn't a User/Organization/Subscription/AuditLog
+// peer: it's a fixed, global catalog (the ~13 permission-key rows seeded once in Task 3), not
+// per-tenant data, and it carries no organizationId column for RLS to key on in the first place.
+const PLATFORM_MODEL_KEYS = new Set(['user', 'organization', 'subscription', 'auditLog', 'permission'])
+const ALSO_ALLOWED = new Set(['$connect', '$disconnect'])
+
+export class TenantScopedModelAccessError extends Error {
+  constructor(prop: string) {
+    super(
+      `Blocked direct access to prisma.${prop} — this is not one of the platform-level models ` +
+        `(user, organization, subscription, auditLog, permission). Tenant-scoped models, and any ` +
+        `transaction or raw SQL, must go through withTenantContext(organizationId, (tx) => ...) from ` +
+        `'@/server/tenant/context' so the Postgres RLS session variable is set before the query runs.`
+    )
+    this.name = 'TenantScopedModelAccessError'
+  }
+}
+
+type PlatformScopedClient = Pick<typeof rawPrisma, 'user' | 'organization' | 'subscription' | 'auditLog' | 'permission' | '$connect' | '$disconnect'>
+
+export const prisma: PlatformScopedClient = new Proxy(rawPrisma, {
+  get(target, prop, receiver) {
+    if (typeof prop === 'string' && !PLATFORM_MODEL_KEYS.has(prop) && !ALSO_ALLOWED.has(prop)) {
+      throw new TenantScopedModelAccessError(prop)
+    }
+    return Reflect.get(target, prop, receiver)
+  },
+}) as PlatformScopedClient
+```
+
+Note `$transaction` is deliberately **not** in `ALSO_ALLOWED`: if it were, `prisma.$transaction(async (tx) => tx.customer.findMany())` would hand back an unrestricted `tx` from Prisma's own internals — a transaction client is a value returned by the method call, not a property access, so the Proxy's `get` trap never sees it and can't guard it. Excluding `$transaction` entirely closes that hole; any multi-step write (including ones that also touch a platform model like `User`) goes through `withTenantContext` instead (Task 9), whose `tx` is intentionally unrestricted because obtaining it already proves the RLS context was set first.
+
+- [ ] **Step 4: Run the initial migration**
 
 ```bash
 npx prisma migrate dev --name init_platform_schema
 ```
 Expected: migration applies cleanly, Prisma Client regenerates.
 
-- [ ] **Step 4: Write the failing test**
+- [ ] **Step 5: Write the failing platform-schema test**
 
 `tests/db/platform-schema.test.ts`:
 ```typescript
@@ -328,16 +379,42 @@ describe('platform-level schema', () => {
 })
 ```
 
-- [ ] **Step 5: Run test, confirm it needs a real database**
+- [ ] **Step 6: Write the failing tenant-access-boundary test**
 
-Run: `npm run test -- platform-schema`
-Expected: PASS if `DATABASE_URL` in `.env` points to a real reachable Postgres instance (Supabase project created for this task — document the connection string in local `.env`, not committed). If no DB is reachable yet, this is the point to provision one before continuing.
+`tests/db/tenant-access-boundary.test.ts`:
+```typescript
+import { describe, it, expect } from 'vitest'
+import { prisma, TenantScopedModelAccessError } from '@/db/client'
 
-- [ ] **Step 6: Commit**
+describe('tenant-access boundary', () => {
+  it('blocks direct access to a tenant-scoped model (branch)', () => {
+    expect(() => (prisma as unknown as { branch: unknown }).branch).toThrow(TenantScopedModelAccessError)
+  })
+
+  it('blocks $transaction, since its callback would hand back an unrestricted client', () => {
+    expect(() => (prisma as unknown as { $transaction: unknown }).$transaction).toThrow(TenantScopedModelAccessError)
+  })
+
+  it('still allows the five platform-level models', () => {
+    expect(() => prisma.user).not.toThrow()
+    expect(() => prisma.organization).not.toThrow()
+    expect(() => prisma.subscription).not.toThrow()
+    expect(() => prisma.auditLog).not.toThrow()
+    expect(() => prisma.permission).not.toThrow()
+  })
+})
+```
+
+- [ ] **Step 7: Run both tests**
+
+Run: `npm run test -- platform-schema tenant-access-boundary`
+Expected: both PASS if `DATABASE_URL` in `.env` points to a real reachable Postgres instance (Supabase project created for this task — document the connection string in local `.env`, not committed). If no DB is reachable yet, this is the point to provision one before continuing. The boundary test needs no DB connection at all — it only exercises the Proxy.
+
+- [ ] **Step 8: Commit**
 
 ```bash
 git add prisma src/db tests/db .env.example
-git commit -m "Add Prisma platform-level schema (User, Organization, Branch, Subscription, AuditLog)"
+git commit -m "Add Prisma platform-level schema and the tenant-access boundary (rawPrisma/prisma split)"
 ```
 
 ---
@@ -510,7 +587,10 @@ npx prisma migrate dev --name add_rbac_schema
 `tests/db/rbac-schema.test.ts`:
 ```typescript
 import { describe, it, expect, afterAll } from 'vitest'
-import { prisma } from '@/db/client'
+// Schema-verification tests sit outside the application layer the rawPrisma/prisma
+// split (Task 2) protects, so they use rawPrisma directly — aliased to `prisma` here
+// purely so the rest of this file's assertions don't need renaming.
+import { rawPrisma as prisma } from '@/db/raw-client'
 import { seedGlobalPermissions, seedDefaultRolesForOrganization } from '../../prisma/seed'
 
 describe('RBAC schema', () => {
@@ -656,7 +736,9 @@ npx prisma migrate dev --name add_customer_staff_schema
 `tests/db/people-schema.test.ts`:
 ```typescript
 import { describe, it, expect, afterAll } from 'vitest'
-import { prisma } from '@/db/client'
+// See the note in Task 3's rbac-schema.test.ts: schema-verification tests use
+// rawPrisma directly, aliased to `prisma` so assertions below read naturally.
+import { rawPrisma as prisma } from '@/db/raw-client'
 
 describe('customer & staff schema', () => {
   afterAll(async () => {
@@ -872,7 +954,9 @@ npx prisma migrate dev --name add_scheduling_schema
 `tests/db/scheduling-schema.test.ts`:
 ```typescript
 import { describe, it, expect, afterAll } from 'vitest'
-import { prisma } from '@/db/client'
+// See the note in Task 3's rbac-schema.test.ts: schema-verification tests use
+// rawPrisma directly, aliased to `prisma` so assertions below read naturally.
+import { rawPrisma as prisma } from '@/db/raw-client'
 
 async function makeOrgBranchService(schedulingType: 'FIXED_SESSION' | 'DYNAMIC') {
   const org = await prisma.organization.create({
@@ -1077,7 +1161,9 @@ npx prisma migrate dev
 `tests/db/membership-schema.test.ts`:
 ```typescript
 import { describe, it, expect, afterAll } from 'vitest'
-import { prisma } from '@/db/client'
+// See the note in Task 3's rbac-schema.test.ts: schema-verification tests use
+// rawPrisma directly, aliased to `prisma` so assertions below read naturally.
+import { rawPrisma as prisma } from '@/db/raw-client'
 
 describe('membership plan schema', () => {
   afterAll(async () => {
@@ -1270,7 +1356,9 @@ npx prisma migrate dev
 `tests/db/loyalty-schema.test.ts`:
 ```typescript
 import { describe, it, expect, afterAll } from 'vitest'
-import { prisma } from '@/db/client'
+// See the note in Task 3's rbac-schema.test.ts: schema-verification tests use
+// rawPrisma directly, aliased to `prisma` so assertions below read naturally.
+import { rawPrisma as prisma } from '@/db/raw-client'
 
 describe('loyalty schema', () => {
   afterAll(async () => {
@@ -1421,7 +1509,9 @@ npx prisma migrate dev --name add_payment_notification_schema
 `tests/db/payment-notification-schema.test.ts`:
 ```typescript
 import { describe, it, expect, afterAll } from 'vitest'
-import { prisma } from '@/db/client'
+// See the note in Task 3's rbac-schema.test.ts: schema-verification tests use
+// rawPrisma directly, aliased to `prisma` so assertions below read naturally.
+import { rawPrisma as prisma } from '@/db/raw-client'
 
 describe('payment & notification schema', () => {
   afterAll(async () => {
@@ -1473,8 +1563,8 @@ git commit -m "Add Payment and Notification schema"
 - Test: `tests/server/tenant-context.test.ts`
 
 **Interfaces:**
-- Consumes: `prisma` from Task 2.
-- Produces: `withTenantContext<T>(organizationId: string, fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T>` — every tenant-scoped write/read in later tasks goes through this.
+- Consumes: `rawPrisma` from Task 2 (`src/db/raw-client.ts`) — this is the one sanctioned application-layer import of it, per Task 2's docstring.
+- Produces: `withTenantContext<T>(organizationId: string, fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T>` — the *only* way any application code (Tasks 11-21 onward) can reach a tenant-scoped model, since Task 2's `prisma` Proxy already throws on direct access to one.
 
 - [ ] **Step 1: Write the RLS migration**
 
@@ -1482,7 +1572,7 @@ git commit -m "Add Payment and Notification schema"
 npx prisma migrate dev --name enable_rls --create-only
 ```
 
-Edit the generated SQL to enable RLS on every tenant-scoped table and add a policy keyed on the session variable. Repeat the `ENABLE ROW LEVEL SECURITY` + `CREATE POLICY` pair for: `Membership`, `Role` (excluding platform-level null-org rows via `organizationId IS NULL OR ...`), `RolePermission` is permission-junction so relies on `Role`'s policy via join — skip direct RLS there since it has no `organizationId` column; `Customer`, `Staff`, `Horse`, `Service`, `BlockedTime`, `RidingSession`, `Booking`, `CheckIn`, `MembershipPlan`, `CustomerMembership`, `LoyaltyAccount`, `LoyaltyTransaction`, `Reward`, `RewardRedemption`, `Payment`, `Notification`:
+Edit the generated SQL to enable RLS on every tenant-scoped table that has an `organizationId` column, with a policy keyed on the session variable. Repeat the `ENABLE ROW LEVEL SECURITY` + `CREATE POLICY` pair for: `Branch`, `Membership`, `Role` (nullable org — see below), `Customer`, `Staff`, `Horse`, `Service`, `BlockedTime`, `RidingSession`, `Booking`, `CheckIn`, `MembershipPlan`, `CustomerMembership`, `LoyaltyAccount`, `LoyaltyTransaction`, `Reward`, `RewardRedemption`, `Payment`, `Notification`:
 
 ```sql
 -- Repeat this pair for each tenant-scoped table listed above, substituting the table name:
@@ -1498,6 +1588,8 @@ CREATE POLICY tenant_isolation ON "Role"
   USING ("organizationId" IS NULL OR "organizationId" = current_setting('app.current_tenant_id', true));
 ```
 
+`Trainer`, `RolePermission`, `MembershipPlanService`, and `MembershipPlanBranch` have no `organizationId` column (they're join/extension tables), so they get no RLS policy of their own — their isolation depends on always being queried joined to their RLS-protected parent (`Staff`, `Role`, `MembershipPlan`) inside the same `withTenantContext` transaction. They're still blocked from direct top-level access by Task 2's Proxy (nothing is in its platform allowlist except `user`/`organization`/`subscription`/`auditLog`), so there's no path to query them without already being inside a verified tenant context — it just doesn't happen to be reinforced by a Postgres policy for these four.
+
 Apply:
 ```bash
 npx prisma migrate dev
@@ -1507,13 +1599,13 @@ npx prisma migrate dev
 
 ```typescript
 import { Prisma } from '@prisma/client'
-import { prisma } from '@/db/client'
+import { rawPrisma } from '@/db/raw-client'
 
 export async function withTenantContext<T>(
   organizationId: string,
   fn: (tx: Prisma.TransactionClient) => Promise<T>
 ): Promise<T> {
-  return prisma.$transaction(async (tx) => {
+  return rawPrisma.$transaction(async (tx) => {
     await tx.$executeRawUnsafe(
       `SET LOCAL app.current_tenant_id = '${organizationId.replace(/'/g, "''")}'`
     )
@@ -1528,6 +1620,7 @@ export async function withTenantContext<T>(
 ```typescript
 import { describe, it, expect, afterAll } from 'vitest'
 import { prisma } from '@/db/client'
+import { rawPrisma } from '@/db/raw-client'
 import { withTenantContext } from '@/server/tenant/context'
 
 describe('withTenantContext', () => {
@@ -1535,7 +1628,7 @@ describe('withTenantContext', () => {
     await prisma.$disconnect()
   })
 
-  it('only returns rows belonging to the active tenant', async () => {
+  it('only returns rows belonging to the active tenant, for both the write and the read', async () => {
     const orgA = await prisma.organization.create({ data: { name: 'A', slug: `a-${Date.now()}` } })
     const orgB = await prisma.organization.create({ data: { name: 'B', slug: `b-${Date.now()}` } })
     const userA = await prisma.user.create({
@@ -1544,22 +1637,50 @@ describe('withTenantContext', () => {
     const userB = await prisma.user.create({
       data: { email: `ub-${Date.now()}@test.com`, passwordHash: 'x', type: 'CUSTOMER', name: 'User B' },
     })
-    await prisma.customer.create({ data: { organizationId: orgA.id, userId: userA.id, firstName: 'A', lastName: 'A' } })
-    await prisma.customer.create({ data: { organizationId: orgB.id, userId: userB.id, firstName: 'B', lastName: 'B' } })
+
+    // Writes go through withTenantContext too — there is no other way to create a
+    // Customer row at all, since prisma.customer is blocked (Task 2).
+    await withTenantContext(orgA.id, (tx) =>
+      tx.customer.create({ data: { organizationId: orgA.id, userId: userA.id, firstName: 'A', lastName: 'A' } })
+    )
+    await withTenantContext(orgB.id, (tx) =>
+      tx.customer.create({ data: { organizationId: orgB.id, userId: userB.id, firstName: 'B', lastName: 'B' } })
+    )
 
     const visibleToA = await withTenantContext(orgA.id, (tx) => tx.customer.findMany())
     expect(visibleToA.every((c) => c.organizationId === orgA.id)).toBe(true)
     expect(visibleToA.some((c) => c.organizationId === orgB.id)).toBe(false)
   })
+
+  it('cannot be bypassed: prisma.customer throws before any query runs', () => {
+    expect(() => (prisma as unknown as { customer: unknown }).customer).toThrow()
+  })
+
+  it('sets a real, verifiable Postgres session variable inside the transaction', async () => {
+    const org = await prisma.organization.create({ data: { name: 'Session Var Test', slug: `svt-${Date.now()}` } })
+    const observed = await withTenantContext(org.id, async (tx) => {
+      const rows = await tx.$queryRawUnsafe<{ current_setting: string }[]>(
+        `SELECT current_setting('app.current_tenant_id', true)`
+      )
+      return rows[0].current_setting
+    })
+    expect(observed).toBe(org.id)
+    // Outside any withTenantContext transaction the setting reverts — SET LOCAL is
+    // transaction-scoped by design, so a later unrelated transaction never inherits it.
+    const afterCommit = await rawPrisma.$queryRawUnsafe<{ current_setting: string }[]>(
+      `SELECT current_setting('app.current_tenant_id', true)`
+    )
+    expect(afterCommit[0].current_setting).not.toBe(org.id)
+  })
 })
 ```
-
-**Known Phase 0 scope limitation, stated precisely rather than glossed over:** Postgres exempts a table's *owner* from its own RLS policies unless the table is altered with `FORCE ROW LEVEL SECURITY`. The role that ran `prisma migrate dev` owns these tables, so if the app connects to Postgres as that same role (the default/simplest setup, and what this plan assumes), RLS is enabled and real, but effectively inert for the app's own queries — the application-layer `where: { organizationId }` filter (present on every query in Tasks 11-21) is, in practice, the layer actually protecting tenant isolation in Phase 0. Only calls routed through `withTenantContext` (this task) exercise the RLS policy today; Tasks 11-21 do not yet route their Prisma calls through it. This is an intentional Phase 0 scope limitation, not a silent gap: making RLS load-bearing (not just present) requires *both* switching the app's runtime connection to a restricted, non-owner Postgres role *and* threading every tenant-scoped call in Tasks 11-21 through `withTenantContext` (or an equivalent request-scoped mechanism) — track this as a hardening item before handling real customer data, and re-run this test under that restricted role at that time to confirm it actually blocks a cross-tenant read.
 
 - [ ] **Step 4: Run test**
 
 Run: `npm run test -- tenant-context`
 Expected: PASS.
+
+**Remaining, purely operational caveat (not a code gap):** Postgres exempts a table's *owner* from its own RLS policies unless the table is altered with `FORCE ROW LEVEL SECURITY`. The role that ran `prisma migrate dev` owns these tables, so if the app's runtime DB connection uses that same role, the policies from Step 1 are real and enabled but structurally skipped for that role's own queries — meaning RLS is present but not currently filtering anything, regardless of how carefully application code calls `withTenantContext`. This is now purely a deployment/infrastructure choice, not an application-code gap: every tenant-scoped query in this codebase already goes through `withTenantContext` (enforced by Task 2's Proxy, which makes the alternative a thrown error, not just a discouraged pattern) — closing this caveat only requires pointing the runtime connection at a restricted, non-owner Postgres role before handling real customer data, with no further code changes. Track that role switch as a pre-launch infrastructure task, and re-run this file's first test under that role at that time to see it actually block a cross-tenant read rather than merely return correctly-scoped data by virtue of the application-layer filter.
 
 - [ ] **Step 5: Commit**
 
@@ -1749,7 +1870,7 @@ git commit -m "Add Auth.js config, password hashing, and credentials verificatio
 - Test: `tests/server/staff-auth.test.ts`
 
 **Interfaces:**
-- Consumes: `prisma`, `hashPassword` from Tasks 2/10; `Role`/`Membership`/`Staff` models from Task 3/4.
+- Consumes: `hashPassword` from Task 10; `withTenantContext` from Task 9; `Role`/`Membership`/`Staff` models from Task 3/4.
 - Produces: `createStaffAccount(input): Promise<{ userId: string; staffId: string }>`.
 
 - [ ] **Step 1: Write the failing test**
@@ -1758,6 +1879,7 @@ git commit -m "Add Auth.js config, password hashing, and credentials verificatio
 ```typescript
 import { describe, it, expect, afterAll } from 'vitest'
 import { prisma } from '@/db/client'
+import { withTenantContext } from '@/server/tenant/context'
 import { createStaffAccount } from '@/server/actions/staff-auth'
 import { verifyCredentials } from '@/server/auth/credentials'
 
@@ -1770,7 +1892,7 @@ describe('createStaffAccount', () => {
     const org = await prisma.organization.create({
       data: { name: 'Staff Auth Test', slug: `staff-auth-${Date.now()}` },
     })
-    const role = await prisma.role.create({ data: { organizationId: org.id, name: 'OWNER' } })
+    const role = await withTenantContext(org.id, (tx) => tx.role.create({ data: { organizationId: org.id, name: 'OWNER' } }))
     const email = `owner-${Date.now()}@test.com`
 
     const { userId, staffId } = await createStaffAccount({
@@ -1780,9 +1902,9 @@ describe('createStaffAccount', () => {
     expect(userId).toBeTruthy()
     expect(staffId).toBeTruthy()
 
-    const membership = await prisma.membership.findUniqueOrThrow({
-      where: { userId_organizationId: { userId, organizationId: org.id } },
-    })
+    const membership = await withTenantContext(org.id, (tx) =>
+      tx.membership.findUniqueOrThrow({ where: { userId_organizationId: { userId, organizationId: org.id } } })
+    )
     expect(membership.roleId).toBe(role.id)
 
     const loggedIn = await verifyCredentials(email, 'owner-password-1')
@@ -1802,8 +1924,8 @@ Expected: FAIL — module not found.
 'use server'
 
 import { z } from 'zod'
-import { prisma } from '@/db/client'
 import { hashPassword } from '@/server/auth/password'
+import { withTenantContext } from '@/server/tenant/context'
 
 const createStaffAccountSchema = z.object({
   organizationId: z.string(),
@@ -1818,7 +1940,11 @@ export async function createStaffAccount(input: z.infer<typeof createStaffAccoun
   const data = createStaffAccountSchema.parse(input)
   const passwordHash = await hashPassword(data.password)
 
-  return prisma.$transaction(async (tx) => {
+  // User is a platform-level model, but it's created inside the same withTenantContext
+  // transaction as the tenant-scoped Staff/Membership rows so all three commit atomically —
+  // there is no separate prisma.$transaction path available (Task 2 blocks it), and there
+  // doesn't need to be: withTenantContext's tx already has every model, User included.
+  return withTenantContext(data.organizationId, async (tx) => {
     const user = await tx.user.create({
       data: { email: data.email, passwordHash, type: 'STAFF', name: data.name },
     })
@@ -1931,7 +2057,7 @@ git commit -m "Add staff account creation and sign-in page"
 - Test: `tests/server/customer-auth.test.ts`
 
 **Interfaces:**
-- Consumes: `prisma`, `hashPassword` from Tasks 2/10; `Customer` model from Task 4.
+- Consumes: `hashPassword` from Task 10; `withTenantContext` from Task 9; `Customer` model from Task 4.
 - Produces: `createCustomerAccount(input): Promise<{ userId: string; customerId: string; qrToken: string }>`.
 
 - [ ] **Step 1: Write the failing test**
@@ -1940,6 +2066,7 @@ git commit -m "Add staff account creation and sign-in page"
 ```typescript
 import { describe, it, expect, afterAll } from 'vitest'
 import { prisma } from '@/db/client'
+import { withTenantContext } from '@/server/tenant/context'
 import { createCustomerAccount } from '@/server/actions/customer-auth'
 import { verifyCredentials } from '@/server/auth/credentials'
 
@@ -1959,7 +2086,7 @@ describe('createCustomerAccount', () => {
     })
 
     expect(qrToken).toBeTruthy()
-    const customer = await prisma.customer.findUniqueOrThrow({ where: { id: customerId } })
+    const customer = await withTenantContext(org.id, (tx) => tx.customer.findUniqueOrThrow({ where: { id: customerId } }))
     expect(customer.userId).toBe(userId)
     expect(customer.qrToken).toBe(qrToken)
 
@@ -1992,8 +2119,8 @@ Expected: FAIL — module not found.
 'use server'
 
 import { z } from 'zod'
-import { prisma } from '@/db/client'
 import { hashPassword } from '@/server/auth/password'
+import { withTenantContext } from '@/server/tenant/context'
 
 const createCustomerAccountSchema = z.object({
   organizationId: z.string(),
@@ -2007,7 +2134,10 @@ const createCustomerAccountSchema = z.object({
 export async function createCustomerAccount(input: z.infer<typeof createCustomerAccountSchema>) {
   const data = createCustomerAccountSchema.parse(input)
 
-  return prisma.$transaction(async (tx) => {
+  // Same reasoning as createStaffAccount (Task 11): User is platform-level but is created
+  // inside the same withTenantContext transaction as the tenant-scoped Customer row so both
+  // commit atomically, without needing a separate (blocked) prisma.$transaction path.
+  return withTenantContext(data.organizationId, async (tx) => {
     let user = await tx.user.findUnique({ where: { email: data.email } })
     if (!user) {
       user = await tx.user.create({
@@ -2120,8 +2250,8 @@ git commit -m "Add customer account creation with QR token and sign-in page"
 - Test: `tests/server/auth-guards.test.ts`
 
 **Interfaces:**
-- Consumes: `auth()` from Task 10; `Membership`/`Role`/`Permission`/`Customer` models.
-- Produces: `getSessionUser(): Promise<{ id: string; type: UserType } | null>`, `requirePermission(organizationId: string, permission: Permission): Promise<{ userId: string; membershipId: string }>` (throws if unauthorized), `requireCustomer(organizationId: string): Promise<{ userId: string; customerId: string }>` (throws if not a customer of that org).
+- Consumes: `auth()` from Task 10; `withTenantContext` from Task 9; `Membership`/`Role`/`Permission`/`Customer` models.
+- Produces: `getSessionUser(): Promise<{ id: string; type: UserType } | null>`, `requirePermission(organizationId: string, permission: Permission): Promise<{ userId: string; membershipId: string }>` (throws if unauthorized), `requireCustomer(organizationId: string): Promise<{ userId: string; customerId: string }>` (throws if not a customer of that org). **These two are where every later task's tenant-scoped access starts** — they establish the verified `organizationId` and immediately do their own lookup inside `withTenantContext`, so nothing downstream ever receives an unverified tenant id.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2129,6 +2259,9 @@ git commit -m "Add customer account creation with QR token and sign-in page"
 ```typescript
 import { describe, it, expect, afterAll, vi } from 'vitest'
 import { prisma } from '@/db/client'
+// Test fixtures for tenant-scoped models (Role, Membership, Customer) go through
+// withTenantContext, same as application code would — see Task 9.
+import { withTenantContext } from '@/server/tenant/context'
 import { requirePermission, requireCustomer } from '@/server/auth/guards'
 
 vi.mock('@/server/auth/config', () => ({
@@ -2147,12 +2280,14 @@ describe('requirePermission', () => {
     const permission = await prisma.permission.upsert({
       where: { key: 'bookings.manage' }, update: {}, create: { key: 'bookings.manage', description: 'x' },
     })
-    const role = await prisma.role.create({ data: { organizationId: org.id, name: 'FRONT_DESK' } })
-    await prisma.rolePermission.create({ data: { roleId: role.id, permissionId: permission.id } })
     const user = await prisma.user.create({
       data: { email: `guard-${Date.now()}@test.com`, passwordHash: 'x', type: 'STAFF', name: 'Guard User' },
     })
-    await prisma.membership.create({ data: { userId: user.id, organizationId: org.id, roleId: role.id } })
+    await withTenantContext(org.id, async (tx) => {
+      const role = await tx.role.create({ data: { organizationId: org.id, name: 'FRONT_DESK' } })
+      await tx.rolePermission.create({ data: { roleId: role.id, permissionId: permission.id } })
+      await tx.membership.create({ data: { userId: user.id, organizationId: org.id, roleId: role.id } })
+    })
 
     vi.mocked(auth).mockResolvedValue({ user: { id: user.id } } as never)
 
@@ -2162,11 +2297,13 @@ describe('requirePermission', () => {
 
   it('throws for a staff member whose role lacks the permission', async () => {
     const org = await prisma.organization.create({ data: { name: 'Guard Test 2', slug: `guard2-${Date.now()}` } })
-    const role = await prisma.role.create({ data: { organizationId: org.id, name: 'TRAINER' } })
     const user = await prisma.user.create({
       data: { email: `guard2-${Date.now()}@test.com`, passwordHash: 'x', type: 'STAFF', name: 'Guard User 2' },
     })
-    await prisma.membership.create({ data: { userId: user.id, organizationId: org.id, roleId: role.id } })
+    await withTenantContext(org.id, async (tx) => {
+      const role = await tx.role.create({ data: { organizationId: org.id, name: 'TRAINER' } })
+      await tx.membership.create({ data: { userId: user.id, organizationId: org.id, roleId: role.id } })
+    })
 
     vi.mocked(auth).mockResolvedValue({ user: { id: user.id } } as never)
 
@@ -2178,7 +2315,9 @@ describe('requirePermission', () => {
     const user = await prisma.user.create({
       data: { email: `guard3-${Date.now()}@test.com`, passwordHash: 'x', type: 'CUSTOMER', name: 'Customer Guard' },
     })
-    await prisma.customer.create({ data: { organizationId: org.id, userId: user.id, firstName: 'C', lastName: 'G' } })
+    await withTenantContext(org.id, (tx) =>
+      tx.customer.create({ data: { organizationId: org.id, userId: user.id, firstName: 'C', lastName: 'G' } })
+    )
 
     vi.mocked(auth).mockResolvedValue({ user: { id: user.id } } as never)
 
@@ -2192,7 +2331,9 @@ describe('requireCustomer', () => {
     const user = await prisma.user.create({
       data: { email: `guard4-${Date.now()}@test.com`, passwordHash: 'x', type: 'CUSTOMER', name: 'Customer Four' },
     })
-    const customer = await prisma.customer.create({ data: { organizationId: org.id, userId: user.id, firstName: 'C', lastName: 'F' } })
+    const customer = await withTenantContext(org.id, (tx) =>
+      tx.customer.create({ data: { organizationId: org.id, userId: user.id, firstName: 'C', lastName: 'F' } })
+    )
 
     vi.mocked(auth).mockResolvedValue({ user: { id: user.id } } as never)
 
@@ -2202,11 +2343,13 @@ describe('requireCustomer', () => {
 
   it('throws for a staff member (never grants customer-portal access to staff)', async () => {
     const org = await prisma.organization.create({ data: { name: 'Guard Test 5', slug: `guard5-${Date.now()}` } })
-    const role = await prisma.role.create({ data: { organizationId: org.id, name: 'OWNER' } })
     const user = await prisma.user.create({
       data: { email: `guard5-${Date.now()}@test.com`, passwordHash: 'x', type: 'STAFF', name: 'Staff Five' },
     })
-    await prisma.membership.create({ data: { userId: user.id, organizationId: org.id, roleId: role.id } })
+    await withTenantContext(org.id, async (tx) => {
+      const role = await tx.role.create({ data: { organizationId: org.id, name: 'OWNER' } })
+      await tx.membership.create({ data: { userId: user.id, organizationId: org.id, roleId: role.id } })
+    })
 
     vi.mocked(auth).mockResolvedValue({ user: { id: user.id } } as never)
 
@@ -2225,6 +2368,7 @@ Expected: FAIL — module not found.
 ```typescript
 import { prisma } from '@/db/client'
 import { auth } from '@/server/auth/config'
+import { withTenantContext } from '@/server/tenant/context'
 import type { Permission } from '@/config/permissions'
 
 export async function getSessionUser() {
@@ -2240,14 +2384,16 @@ export async function requirePermission(organizationId: string, permission: Perm
   if (!sessionUser || sessionUser.type !== 'STAFF') {
     throw new Error('Not authorized: staff session required')
   }
-  const membership = await prisma.membership.findUnique({
-    where: { userId_organizationId: { userId: sessionUser.id, organizationId } },
-    include: { role: { include: { permissions: { include: { permission: true } } } } },
+  return withTenantContext(organizationId, async (tx) => {
+    const membership = await tx.membership.findUnique({
+      where: { userId_organizationId: { userId: sessionUser.id, organizationId } },
+      include: { role: { include: { permissions: { include: { permission: true } } } } },
+    })
+    if (!membership) throw new Error('Not authorized: no membership in this organization')
+    const hasPermission = membership.role.permissions.some((rp) => rp.permission.key === permission)
+    if (!hasPermission) throw new Error(`Not authorized: missing permission ${permission}`)
+    return { userId: sessionUser.id, membershipId: membership.id }
   })
-  if (!membership) throw new Error('Not authorized: no membership in this organization')
-  const hasPermission = membership.role.permissions.some((rp) => rp.permission.key === permission)
-  if (!hasPermission) throw new Error(`Not authorized: missing permission ${permission}`)
-  return { userId: sessionUser.id, membershipId: membership.id }
 }
 
 export async function requireCustomer(organizationId: string) {
@@ -2255,11 +2401,13 @@ export async function requireCustomer(organizationId: string) {
   if (!sessionUser || sessionUser.type !== 'CUSTOMER') {
     throw new Error('Not authorized: customer session required')
   }
-  const customer = await prisma.customer.findUnique({
-    where: { organizationId_userId: { organizationId, userId: sessionUser.id } },
+  return withTenantContext(organizationId, async (tx) => {
+    const customer = await tx.customer.findUnique({
+      where: { organizationId_userId: { organizationId, userId: sessionUser.id } },
+    })
+    if (!customer) throw new Error('Not authorized: no customer profile in this organization')
+    return { userId: sessionUser.id, customerId: customer.id }
   })
-  if (!customer) throw new Error('Not authorized: no customer profile in this organization')
-  return { userId: sessionUser.id, customerId: customer.id }
 }
 ```
 
@@ -3264,7 +3412,7 @@ git commit -m "Add Super Admin shell: layout, Organizations (real data), Subscri
 - Create: `src/app/[orgSlug]/(dashboard)/customers/page.tsx`, `horses/page.tsx`, `trainers/page.tsx`, `staff/page.tsx`, `services/page.tsx`, `bookings/page.tsx`, `check-ins/page.tsx`, `loyalty/page.tsx`, `rewards/page.tsx`, `payments/page.tsx`, `notifications/page.tsx`, `reports/page.tsx`, `settings/page.tsx`
 
 **Interfaces:**
-- Consumes: `getSessionUser` (Task 13), `assertOrganizationActive`/`OrganizationInactiveError` (Task 15), `PageHeader`/`StatCard`/`EmptyState` (Task 17).
+- Consumes: `getSessionUser` (Task 13), `withTenantContext` (Task 9), `assertOrganizationActive`/`OrganizationInactiveError` (Task 15), `PageHeader`/`StatCard`/`EmptyState` (Task 17).
 - Produces: `/[orgSlug]/(dashboard)` route tree — resolves `orgSlug` to an organization, verifies the session belongs to a staff member of that org, verifies the subscription is active, and renders a styled overview.
 
 - [ ] **Step 1: Build the dashboard layout with tenant resolution, staff auth, and subscription gating**
@@ -3274,6 +3422,7 @@ git commit -m "Add Super Admin shell: layout, Organizations (real data), Subscri
 import { notFound, redirect } from 'next/navigation'
 import { prisma } from '@/db/client'
 import { getSessionUser } from '@/server/auth/guards'
+import { withTenantContext } from '@/server/tenant/context'
 import { assertOrganizationActive, OrganizationInactiveError } from '@/server/billing/guards'
 import {
   Users, Rabbit, GraduationCap, UserCog, ListChecks, CalendarDays, ScanLine, Award, Gift, CreditCard, Bell, BarChart3, Settings,
@@ -3310,9 +3459,11 @@ export default async function DashboardLayout({
   const sessionUser = await getSessionUser()
   if (!sessionUser || sessionUser.type !== 'STAFF') redirect('/staff/sign-in')
 
-  const membership = await prisma.membership.findUnique({
-    where: { userId_organizationId: { userId: sessionUser.id, organizationId: organization.id } },
-  })
+  const membership = await withTenantContext(organization.id, (tx) =>
+    tx.membership.findUnique({
+      where: { userId_organizationId: { userId: sessionUser.id, organizationId: organization.id } },
+    })
+  )
   if (!membership) redirect('/staff/sign-in')
 
   try {
@@ -3350,6 +3501,7 @@ export default async function DashboardLayout({
 `src/app/[orgSlug]/(dashboard)/page.tsx`:
 ```tsx
 import { prisma } from '@/db/client'
+import { withTenantContext } from '@/server/tenant/context'
 import { PageHeader } from '@/components/shared/page-header'
 import { StatCard } from '@/components/shared/stat-card'
 
@@ -3357,13 +3509,16 @@ export default async function DashboardOverviewPage({ params }: { params: Promis
   const { orgSlug } = await params
   const organization = await prisma.organization.findUniqueOrThrow({ where: { slug: orgSlug } })
 
-  const [customerCount, horseCount, upcomingBookingCount] = await Promise.all([
-    prisma.customer.count({ where: { organizationId: organization.id } }),
-    prisma.horse.count({ where: { organizationId: organization.id } }),
-    prisma.booking.count({
-      where: { organizationId: organization.id, status: { in: ['PENDING', 'CONFIRMED'] } },
-    }),
-  ])
+  const { customerCount, horseCount, upcomingBookingCount } = await withTenantContext(organization.id, async (tx) => {
+    const [customerCount, horseCount, upcomingBookingCount] = await Promise.all([
+      tx.customer.count({ where: { organizationId: organization.id } }),
+      tx.horse.count({ where: { organizationId: organization.id } }),
+      tx.booking.count({
+        where: { organizationId: organization.id, status: { in: ['PENDING', 'CONFIRMED'] } },
+      }),
+    ])
+    return { customerCount, horseCount, upcomingBookingCount }
+  })
 
   return (
     <div className="space-y-6">
@@ -3442,7 +3597,7 @@ git commit -m "Add staff dashboard shell with tenant/auth/subscription gating, r
 - Create: `src/lib/qr.ts`
 
 **Interfaces:**
-- Consumes: `requireCustomer` (Task 13), `PageHeader`/`EmptyState` (Task 17), `qrcode.react` (installed in Task 1).
+- Consumes: `requireCustomer` (Task 13), `withTenantContext` (Task 9), `PageHeader`/`EmptyState` (Task 17), `qrcode.react` (installed in Task 1).
 - Produces: `/[orgSlug]/portal` route tree, gated to `type === 'CUSTOMER'` with an active `Customer` profile in that org; `buildQrPayload(qrToken: string): string`.
 
 - [ ] **Step 1: Write the failing QR payload test**
@@ -3557,6 +3712,7 @@ export default function PortalHomePage() {
 import { notFound } from 'next/navigation'
 import { prisma } from '@/db/client'
 import { requireCustomer } from '@/server/auth/guards'
+import { withTenantContext } from '@/server/tenant/context'
 import { buildQrPayload } from '@/lib/qr'
 import { QRCodeSVG } from 'qrcode.react'
 
@@ -3566,7 +3722,7 @@ export default async function PortalQrCodePage({ params }: { params: Promise<{ o
   if (!organization) notFound()
 
   const { customerId } = await requireCustomer(organization.id)
-  const customer = await prisma.customer.findUniqueOrThrow({ where: { id: customerId } })
+  const customer = await withTenantContext(organization.id, (tx) => tx.customer.findUniqueOrThrow({ where: { id: customerId } }))
 
   return (
     <div className="flex flex-col items-center gap-4 py-8 text-center">
@@ -3586,6 +3742,7 @@ export default async function PortalQrCodePage({ params }: { params: Promise<{ o
 ```typescript
 import { describe, it, expect, vi, afterAll } from 'vitest'
 import { prisma } from '@/db/client'
+import { withTenantContext } from '@/server/tenant/context'
 import { updateCustomerProfile } from '@/server/actions/customer-profile'
 
 vi.mock('@/server/auth/config', () => ({ auth: vi.fn() }))
@@ -3601,9 +3758,9 @@ describe('updateCustomerProfile', () => {
     const user = await prisma.user.create({
       data: { email: `profile-${Date.now()}@test.com`, passwordHash: 'x', type: 'CUSTOMER', name: 'Old Name' },
     })
-    const customer = await prisma.customer.create({
-      data: { organizationId: org.id, userId: user.id, firstName: 'Old', lastName: 'Name' },
-    })
+    const customer = await withTenantContext(org.id, (tx) =>
+      tx.customer.create({ data: { organizationId: org.id, userId: user.id, firstName: 'Old', lastName: 'Name' } })
+    )
     vi.mocked(auth).mockResolvedValue({ user: { id: user.id } } as never)
 
     const updated = await updateCustomerProfile(org.id, { firstName: 'New', lastName: 'Name', phone: '555-0100' })
@@ -3623,8 +3780,8 @@ Expected: FAIL — module not found.
 'use server'
 
 import { z } from 'zod'
-import { prisma } from '@/db/client'
 import { requireCustomer } from '@/server/auth/guards'
+import { withTenantContext } from '@/server/tenant/context'
 
 const updateProfileSchema = z.object({
   firstName: z.string().min(1),
@@ -3635,7 +3792,7 @@ const updateProfileSchema = z.object({
 export async function updateCustomerProfile(organizationId: string, input: z.infer<typeof updateProfileSchema>) {
   const { customerId } = await requireCustomer(organizationId)
   const data = updateProfileSchema.parse(input)
-  return prisma.customer.update({ where: { id: customerId }, data })
+  return withTenantContext(organizationId, (tx) => tx.customer.update({ where: { id: customerId }, data }))
 }
 ```
 
@@ -3694,6 +3851,7 @@ export function ProfileForm({
 import { notFound } from 'next/navigation'
 import { prisma } from '@/db/client'
 import { requireCustomer } from '@/server/auth/guards'
+import { withTenantContext } from '@/server/tenant/context'
 import { ProfileForm } from './profile-form'
 
 export default async function PortalProfilePage({ params }: { params: Promise<{ orgSlug: string }> }) {
@@ -3702,7 +3860,7 @@ export default async function PortalProfilePage({ params }: { params: Promise<{ 
   if (!organization) notFound()
 
   const { customerId } = await requireCustomer(organization.id)
-  const customer = await prisma.customer.findUniqueOrThrow({ where: { id: customerId } })
+  const customer = await withTenantContext(organization.id, (tx) => tx.customer.findUniqueOrThrow({ where: { id: customerId } }))
 
   return (
     <div className="space-y-6">
@@ -3782,7 +3940,15 @@ Expected: no type errors. Fix any and re-run until clean.
 Run: `npm run build`
 Expected: build succeeds. Pay particular attention to dynamic route params (`params` as a `Promise` in Next.js 15 route handlers/pages — already handled with `await params` throughout this plan) and any server/client component boundary errors.
 
-- [ ] **Step 5: Commit any fixes**
+- [ ] **Step 5: Verify the tenant-access boundary has no stragglers**
+
+Run (Git Bash / any POSIX shell):
+```bash
+grep -rn "from '@/db/raw-client'" src/
+```
+Expected: **zero matches.** `rawPrisma` is legitimately imported by `src/db/client.ts` (Task 2) and `src/server/tenant/context.ts` (Task 9) only — both under `src/db` or `src/server/tenant`, not general application code. If this prints a match anywhere else under `src/app`, `src/server/actions`, `src/server/auth`, `src/server/billing`, or `src/server/storage`, that file bypassed the boundary and needs to be fixed to use `withTenantContext` instead before this task is done. (Test files under `tests/` and `prisma/seed.ts` are the documented, sanctioned exceptions — Task 2's docstring — and are not part of this check.)
+
+- [ ] **Step 6: Commit any fixes**
 
 ```bash
 git add -A
@@ -3800,10 +3966,12 @@ git commit -m "Fix lint/typecheck/build issues found in Phase 0 verification pas
 - [ ] A staff user can sign up (via `createStaffAccount`), sign in, and reach `/<orgSlug>` only when that org's subscription is `ACTIVE`.
 - [ ] A customer user can sign up (via `createCustomerAccount`), sign in, and see their real QR code at `/<orgSlug>/portal/qr-code`.
 - [ ] A Super Admin can view real organizations at `/admin/organizations`; Subscriptions/Analytics show a styled "coming later" state, never a fake control.
-- [ ] Every tenant-scoped table has RLS enabled with a tenant-isolation policy, proven by Task 9's test.
+- [ ] Every tenant-scoped table with an `organizationId` column has RLS enabled with a tenant-isolation policy, proven by Task 9's test.
+- [ ] Direct access to any non-platform model via `prisma` (from `@/db/client`) throws `TenantScopedModelAccessError` — proven by Task 2's test — and Task 22 Step 5's grep confirms no application file reaches around this via `rawPrisma`.
+- [ ] Every tenant-scoped read and write in Tasks 11-21 runs inside `withTenantContext`, alongside its explicit `where: { organizationId }` filter — both layers active on every call, not just available.
 - [ ] `LoyaltyTransaction` and `CustomerMembership` both have their DB-level uniqueness guarantees in place and covered by a failing-then-passing test.
 - [ ] No file outside `server/billing/providers/` imports the Stripe SDK; no file outside `server/storage/providers/` imports the Supabase SDK.
 
-**Known limitation carried forward, not silently dropped (see Task 9):** application-layer `where: { organizationId }` filtering is the layer actually enforcing tenant isolation for Tasks 11-21 today; RLS is real and tested but only load-bearing for calls made through `withTenantContext`. Before this app handles real customer data, do both: move the runtime DB connection to a restricted non-owner Postgres role, and thread every tenant-scoped call from Tasks 11-21 through `withTenantContext` (or a request-scoped equivalent) so RLS becomes a true second layer rather than a tested-but-unused one.
+**Remaining operational item, not a code gap (see Task 9):** whether Postgres's RLS policies actually filter anything for the app's own queries still depends on the runtime DB connection using a restricted, non-owner role rather than the migration-owning role (Postgres exempts table owners from their own RLS policies by default). The application-code side of "RLS as a real second boundary" is done — every tenant-scoped call is forced through `withTenantContext`, with no bypass available short of deliberately reaching around the type system and the Proxy guard. Switching the runtime connection's role before handling real customer data is the one remaining step, and it requires no further code changes.
 
 ---
