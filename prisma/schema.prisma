@@ -1,0 +1,86 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserType {
+  SUPER_ADMIN
+  STAFF
+  CUSTOMER
+}
+
+enum SubscriptionStatus {
+  INCOMPLETE
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  UNPAID
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  type         UserType
+  name         String
+  phone        String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Organization {
+  id                        String   @id @default(cuid())
+  name                      String
+  slug                      String   @unique
+  status                    String   @default("ACTIVE")
+  customerSelfBookingEnabled Boolean @default(false)
+  settings                  Json     @default("{}")
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
+
+  branches     Branch[]
+  subscription Subscription?
+}
+
+model Branch {
+  id             String   @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  address        String?
+  timezone       String
+  operatingHours Json     @default("{}")
+  createdAt      DateTime @default(now())
+
+  @@index([organizationId])
+}
+
+model Subscription {
+  id                     String             @id @default(cuid())
+  organizationId         String             @unique
+  organization           Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  provider               String
+  providerCustomerId     String
+  providerSubscriptionId String?
+  planId                 String
+  status                 SubscriptionStatus @default(INCOMPLETE)
+  currentPeriodEnd       DateTime?
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+}
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String?
+  actorUserId    String
+  action         String
+  entityType     String
+  entityId       String
+  metadata       Json     @default("{}")
+  createdAt      DateTime @default(now())
+
+  @@index([organizationId])
+}
