@@ -25,11 +25,7 @@ if (!connectionString) {
 export const rawPrisma =
   globalForPrisma.rawPrisma ??
   new PrismaClient({
-    adapter: new PrismaPg({
-      pool: new Pool({
-        connectionString,
-      }),
-    }),
+    adapter: new PrismaPg(new Pool({ connectionString })),
   })
 
 if (process.env.NODE_ENV !== 'production') {

@@ -10,11 +10,10 @@ describe('tenant-access boundary', () => {
     expect(() => (prisma as unknown as { $transaction: unknown }).$transaction).toThrow(TenantScopedModelAccessError)
   })
 
-  it('still allows the five platform-level models', () => {
+  it('still allows the four platform-level models that exist as of this task (permission joins in Task 3)', () => {
     expect(() => prisma.user).not.toThrow()
     expect(() => prisma.organization).not.toThrow()
     expect(() => prisma.subscription).not.toThrow()
     expect(() => prisma.auditLog).not.toThrow()
-    expect(() => prisma.permission).not.toThrow()
   })
 })
