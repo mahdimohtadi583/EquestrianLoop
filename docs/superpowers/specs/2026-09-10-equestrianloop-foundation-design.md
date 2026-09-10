@@ -178,11 +178,11 @@ Path: `/[orgSlug]/portal/...`, fully separate layout from the staff dashboard, m
 **Platform-level** (no `organizationId`):
 - `User` — id, email (unique), passwordHash, type, name, phone, timestamps
 - `Organization` — id, name, slug (unique), status (independent of billing — Super Admin can suspend regardless of `Subscription.status`), `customerSelfBookingEnabled` (boolean, default false), settings (JSON: branding, loyalty rules)
-- `Branch` — id, organizationId, name, address, timezone, `operatingHours` (JSON, per weekday open/close ranges)
 - `Subscription` — id, organizationId (unique), provider, providerCustomerId, providerSubscriptionId, planId, status, currentPeriodEnd
 - `AuditLog` — id, organizationId (nullable), actorUserId, action, entityType, entityId, metadata (JSON), createdAt
 
 **Tenant-scoped** (`organizationId` + RLS):
+- `Branch` — id, organizationId, name, address, timezone, `operatingHours` (JSON, per weekday open/close ranges) — belongs to one organization, so it's tenant-scoped like everything below, not platform-level; listing it alongside `User`/`Subscription` in an earlier draft of this section was a categorization error, corrected here.
 - `Membership` — id, userId, organizationId, branchId (nullable), roleId, invitedAt, acceptedAt — unique(userId, organizationId)
 - `Role` — id, organizationId (nullable for the platform `SUPER_ADMIN` role), name, isSystemRole
 - `Permission` — id, key (unique), description
