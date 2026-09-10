@@ -294,17 +294,19 @@ if (process.env.NODE_ENV !== 'production') {
 ```typescript
 import { rawPrisma } from './raw-client'
 
-// `permission` is included here even though it isn't a User/Organization/Subscription/AuditLog
-// peer: it's a fixed, global catalog (the ~13 permission-key rows seeded once in Task 3), not
-// per-tenant data, and it carries no organizationId column for RLS to key on in the first place.
-const PLATFORM_MODEL_KEYS = new Set(['user', 'organization', 'subscription', 'auditLog', 'permission'])
+// `permission` joins this allowlist in Task 3, once the Permission model actually exists in
+// schema.prisma (it's a fixed, global catalog — the ~13 permission-key rows seeded once — not
+// per-tenant data, and carries no organizationId column for RLS to key on). Referencing it here
+// before Task 3 adds the model is a TypeScript compile error against the generated Prisma Client
+// type, not just premature — keep this list in lockstep with which models actually exist.
+const PLATFORM_MODEL_KEYS = new Set(['user', 'organization', 'subscription', 'auditLog'])
 const ALSO_ALLOWED = new Set(['$connect', '$disconnect'])
 
 export class TenantScopedModelAccessError extends Error {
   constructor(prop: string) {
     super(
       `Blocked direct access to prisma.${prop} — this is not one of the platform-level models ` +
-        `(user, organization, subscription, auditLog, permission). Tenant-scoped models, and any ` +
+        `(user, organization, subscription, auditLog). Tenant-scoped models, and any ` +
         `transaction or raw SQL, must go through withTenantContext(organizationId, (tx) => ...) from ` +
         `'@/server/tenant/context' so the Postgres RLS session variable is set before the query runs.`
     )
@@ -312,7 +314,7 @@ export class TenantScopedModelAccessError extends Error {
   }
 }
 
-type PlatformScopedClient = Pick<typeof rawPrisma, 'user' | 'organization' | 'subscription' | 'auditLog' | 'permission' | '$connect' | '$disconnect'>
+type PlatformScopedClient = Pick<typeof rawPrisma, 'user' | 'organization' | 'subscription' | 'auditLog' | '$connect' | '$disconnect'>
 
 export const prisma: PlatformScopedClient = new Proxy(rawPrisma, {
   get(target, prop, receiver) {
@@ -395,12 +397,11 @@ describe('tenant-access boundary', () => {
     expect(() => (prisma as unknown as { $transaction: unknown }).$transaction).toThrow(TenantScopedModelAccessError)
   })
 
-  it('still allows the five platform-level models', () => {
+  it('still allows the four platform-level models that exist as of this task (permission joins in Task 3)', () => {
     expect(() => prisma.user).not.toThrow()
     expect(() => prisma.organization).not.toThrow()
     expect(() => prisma.subscription).not.toThrow()
     expect(() => prisma.auditLog).not.toThrow()
-    expect(() => prisma.permission).not.toThrow()
   })
 })
 ```
@@ -421,15 +422,19 @@ git commit -m "Add Prisma platform-level schema and the tenant-access boundary (
 
 ## Task 3: RBAC Schema & Default Role/Permission Seed
 
+> **Plan note:** Task 2 deliberately left `permission` out of `src/db/client.ts`'s `PLATFORM_MODEL_KEYS`/`PlatformScopedClient`, since the `Permission` model didn't exist yet and referencing it was a real `tsc` compile error. This task adds the model, so it also re-adds `permission` to that allowlist (Step 2a below) — Task 13's `tests/server/auth-guards.test.ts` calls `prisma.permission.upsert(...)` through the restricted `@/db/client` import and depends on it being there.
+
 **Files:**
 - Modify: `prisma/schema.prisma`
+- Modify: `src/db/client.ts`
+- Modify: `tests/db/tenant-access-boundary.test.ts`
 - Create: `prisma/seed.ts`
 - Create: `src/config/permissions.ts`
 - Test: `tests/db/rbac-schema.test.ts`
 
 **Interfaces:**
 - Consumes: `prisma` from Task 2, `Organization`/`User` models from Task 2.
-- Produces: models `Membership`, `Role`, `Permission`, `RolePermission`; `PERMISSIONS` const array from `src/config/permissions.ts`; a `prisma db seed` command that creates default roles/permissions for a given organization.
+- Produces: models `Membership`, `Role`, `Permission`, `RolePermission`; `PERMISSIONS` const array from `src/config/permissions.ts`; a `prisma db seed` command that creates default roles/permissions for a given organization; `prisma.permission` now reachable through the restricted `@/db/client` export.
 
 - [ ] **Step 1: Add RBAC models to `prisma/schema.prisma`**
 
@@ -495,7 +500,26 @@ roles       Role[]
 memberships Membership[]
 ```
 
-- [ ] **Step 2: Define the permission catalog**
+- [ ] **Step 2a: Re-add `permission` to the tenant-access boundary's allowlist**
+
+In `src/db/client.ts`, now that `Permission` exists in `schema.prisma`:
+- Add `'permission'` back to `PLATFORM_MODEL_KEYS`.
+- Add `| 'permission'` back to the `PlatformScopedClient` Pick type.
+- Add `permission` back into the `TenantScopedModelAccessError` message's model list.
+
+In `tests/db/tenant-access-boundary.test.ts`, restore the fifth assertion:
+```typescript
+  it('still allows the five platform-level models', () => {
+    expect(() => prisma.user).not.toThrow()
+    expect(() => prisma.organization).not.toThrow()
+    expect(() => prisma.subscription).not.toThrow()
+    expect(() => prisma.auditLog).not.toThrow()
+    expect(() => prisma.permission).not.toThrow()
+  })
+```
+(This replaces the four-model version Task 2 left behind — rename the `it` block back, don't add a duplicate.)
+
+- [ ] **Step 2b: Define the permission catalog**
 
 `src/config/permissions.ts`:
 ```typescript
@@ -643,7 +667,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add prisma src/config tests/db package.json
+git add prisma src/config src/db tests/db package.json
 git commit -m "Add RBAC schema and default role/permission seed"
 ```
 
