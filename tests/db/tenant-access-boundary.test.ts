@@ -30,6 +30,11 @@ const DANGEROUS_CLIENT_KEYS = [
   'staff',
   'trainer',
   'horse',
+  'service',
+  'blockedTime',
+  'ridingSession',
+  'booking',
+  'checkIn',
   '$transaction',
   '$queryRaw',
   '$queryRawUnsafe',
@@ -487,15 +492,23 @@ describe('tenant-access boundary', () => {
       // longer express the exploit. `memberships`/`roles` on Organization and
       // `memberships` on User are Task 3 additions (RBAC schema); `customers`/
       // `staffMembers`/`horses` on Organization and `customer`/`staff` on User
-      // are Task 4 additions (Customer/Staff/Trainer/Horse schema). None of
-      // these affect the branches/subscription exploit paths this test
-      // protects, but the pinned list must still reflect the real datamodel.
+      // are Task 4 additions (Customer/Staff/Trainer/Horse schema);
+      // `services`/`blockedTimes`/`ridingSessions`/`bookings`/`checkIns` on
+      // Organization are Task 5 additions (Service Catalog & Scheduling
+      // schema). None of these affect the branches/subscription exploit paths
+      // this test protects, but the pinned list must still reflect the real
+      // datamodel.
       expect(relationNamesOf('Organization').sort()).toEqual([
+        'blockedTimes',
+        'bookings',
         'branches',
+        'checkIns',
         'customers',
         'horses',
         'memberships',
+        'ridingSessions',
         'roles',
+        'services',
         'staffMembers',
         'subscription',
       ])

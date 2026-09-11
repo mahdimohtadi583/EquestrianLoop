@@ -20,6 +20,42 @@ enum SubscriptionStatus {
   UNPAID
 }
 
+enum SchedulingType {
+  FIXED_SESSION
+  DYNAMIC
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  CANCELED
+  COMPLETED
+  NO_SHOW
+}
+
+enum BookingCreatedVia {
+  STAFF
+  CUSTOMER_SELF_SERVICE
+}
+
+enum RidingSessionStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELED
+}
+
+enum CheckInMethod {
+  QR_SCAN
+  MANUAL
+}
+
+enum BlockedTimeScope {
+  BRANCH
+  TRAINER
+  HORSE
+}
+
 model User {
   id           String   @id @default(cuid())
   email        String   @unique
@@ -52,6 +88,11 @@ model Organization {
   customers    Customer[]
   staffMembers Staff[]
   horses       Horse[]
+  services      Service[]
+  blockedTimes  BlockedTime[]
+  ridingSessions RidingSession[]
+  bookings      Booking[]
+  checkIns      CheckIn[]
 }
 
 model Branch {
@@ -67,6 +108,7 @@ model Branch {
   memberships  Membership[]
   staffMembers Staff[]
   horses       Horse[]
+  ridingSessions RidingSession[]
 
   @@index([organizationId])
 }
@@ -158,6 +200,8 @@ model Customer {
   notes          String?
   createdAt      DateTime @default(now())
 
+  bookings Booking[]
+
   @@unique([organizationId, userId])
   @@index([organizationId])
 }
@@ -186,6 +230,8 @@ model Trainer {
   bio            String?
   specialties    String[]
   certifications String[]
+
+  sessions RidingSession[]
 }
 
 model Horse {
@@ -201,6 +247,111 @@ model Horse {
   photoUrl       String?
   status         String   @default("ACTIVE")
   createdAt      DateTime @default(now())
+
+  sessions RidingSession[]
+
+  @@index([organizationId])
+}
+
+model Service {
+  id             String         @id @default(cuid())
+  organizationId String
+  organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  description    String?
+  durationMinutes Int
+  capacity       Int            @default(1)
+  price          Decimal        @db.Decimal(10, 2)
+  currency       String         @default("USD")
+  customerBookingEnabled Boolean @default(false)
+  schedulingType SchedulingType
+  requiresTrainer Boolean       @default(false)
+  trainerSelectable Boolean     @default(false)
+  requiresHorse  Boolean        @default(false)
+  horseSelectable Boolean       @default(false)
+  requiresPaymentAtBooking Boolean @default(false)
+  maxBookingsPerCustomerPerWeek Int?
+  cancellationAllowed Boolean   @default(true)
+  cancellationCutoffMinutes Int?
+  reschedulingAllowed Boolean   @default(true)
+  reschedulingCutoffMinutes Int?
+  isActive       Boolean        @default(true)
+  createdAt      DateTime       @default(now())
+
+  sessions RidingSession[]
+
+  @@index([organizationId])
+}
+
+model BlockedTime {
+  id             String            @id @default(cuid())
+  organizationId String
+  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  scope          BlockedTimeScope
+  branchId       String?
+  trainerId      String?
+  horseId        String?
+  startsAt       DateTime
+  endsAt         DateTime
+  reason         String?
+
+  @@index([organizationId])
+}
+
+model RidingSession {
+  id             String              @id @default(cuid())
+  organizationId String
+  organization   Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branchId       String
+  branch         Branch              @relation(fields: [branchId], references: [id])
+  serviceId      String
+  service        Service             @relation(fields: [serviceId], references: [id])
+  trainerId      String?
+  trainer        Trainer?            @relation(fields: [trainerId], references: [id])
+  horseId        String?
+  horse          Horse?              @relation(fields: [horseId], references: [id])
+  startsAt       DateTime
+  endsAt         DateTime
+  capacity       Int
+  status         RidingSessionStatus @default(SCHEDULED)
+  createdAt      DateTime            @default(now())
+
+  bookings Booking[]
+
+  @@index([organizationId])
+  @@index([trainerId, startsAt])
+  @@index([horseId, startsAt])
+}
+
+model Booking {
+  id                  String            @id @default(cuid())
+  organizationId      String
+  organization        Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerId          String
+  customer            Customer          @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  ridingSessionId     String
+  ridingSession       RidingSession     @relation(fields: [ridingSessionId], references: [id])
+  status              BookingStatus     @default(PENDING)
+  createdVia          BookingCreatedVia
+  paymentId           String?
+  customerMembershipId String?          // plain scalar, not a @relation: CustomerMembership doesn't exist until Task 6, added later in this same file. Not read or written by any Phase 0 code (unused until Phase 4) — Task 6 may promote this to a full @relation once both models coexist, if a future task needs FK-level integrity here.
+  createdAt           DateTime          @default(now())
+
+  checkIn CheckIn?
+
+  @@index([organizationId])
+  @@index([customerId])
+}
+
+model CheckIn {
+  id                  String        @id @default(cuid())
+  organizationId      String
+  organization        Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  bookingId           String        @unique
+  booking             Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  method              CheckInMethod
+  checkedInAt         DateTime      @default(now())
+  checkedInByStaffId  String
 
   @@index([organizationId])
 }
