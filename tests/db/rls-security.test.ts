@@ -1093,10 +1093,13 @@ describe('RLS coverage of tenant-scoped tables (security items 13 and 14)', () =
       expect(state!.rls, `${table} rowsecurity`).toBe(true)
       expect(state!.force, `${table} force rowsecurity`).toBe(true)
       // One permissive `tenant_isolation` policy each — plus, on
-      // RolePermission only, the RESTRICTIVE FOR DELETE `tenant_delete_isolation`
-      // policy added by 20260911185927_restrict_platform_role_deletes (see the
-      // "Role/RolePermission writes" block below for why).
-      expect(state!.policies, `${table} policy count`).toBe(table === 'RolePermission' ? 2 : 1)
+      // RolePermission only, the two RESTRICTIVE policies that narrow the verbs
+      // WITH CHECK cannot reach: `tenant_delete_isolation` (FOR DELETE, round 1,
+      // 20260911185927_restrict_platform_role_deletes) and
+      // `tenant_update_isolation` (FOR UPDATE's old row, round 2,
+      // 20260911201237_restrict_platform_role_updates). See the two
+      // "Role/RolePermission" blocks below for why.
+      expect(state!.policies, `${table} policy count`).toBe(table === 'RolePermission' ? 3 : 1)
     }
     // And their predicates really are EXISTS subqueries against the parent.
     const quals = await rawPrisma.$queryRawUnsafe<{ tablename: string; qual: string }[]>(
@@ -1170,9 +1173,10 @@ describe('RLS coverage of tenant-scoped tables (security items 13 and 14)', () =
     for (const table of ['Branch', 'Membership', 'Role'] as const) {
       expect(actual.get(table)?.rls, `${table} rowsecurity`).toBe(true)
       expect(actual.get(table)?.force, `${table} force rowsecurity`).toBe(true)
-      // Role additionally carries the RESTRICTIVE FOR DELETE policy from
-      // 20260911185927_restrict_platform_role_deletes.
-      expect(actual.get(table)?.policies, `${table} policy count`).toBe(table === 'Role' ? 2 : 1)
+      // Role additionally carries two RESTRICTIVE policies: FOR DELETE from
+      // 20260911185927_restrict_platform_role_deletes (round 1) and FOR UPDATE
+      // from 20260911201237_restrict_platform_role_updates (round 2).
+      expect(actual.get(table)?.policies, `${table} policy count`).toBe(table === 'Role' ? 3 : 1)
     }
   })
 })
@@ -1537,10 +1541,23 @@ describe('Role/RolePermission writes cannot reach the platform system role (fix 
       thrown = error as Error
     }
     console.log('[rls-security] system-role UPDATE:', { affected, error: thrown?.message.split('\n').pop() })
-    // The row IS visible (USING allows NULL-org), so the UPDATE matches it and
-    // then fails the strict WITH CHECK: an error, not a zero-row no-op.
-    expect(thrown).toBeDefined()
-    expect(thrown!.message).toMatch(/row-level security/i)
+    // BEHAVIOUR CHANGED IN FIX ROUND 2, and strengthened rather than weakened.
+    //
+    // Under round 1 alone this raised an RLS error: UPDATE's USING was still the
+    // permissive read predicate, so the NULL-org row WAS eligible, the statement
+    // matched it, and only then did the strict WITH CHECK reject the row it would
+    // have produced. That rejection depended entirely on the new row being
+    // out of scope — which is exactly why round 1 did not stop the variant that
+    // writes an IN-scope new row (`SET "organizationId" = '<own org>'`).
+    //
+    // 20260911201237_restrict_platform_role_updates adds a RESTRICTIVE FOR UPDATE
+    // policy whose USING is strict, so the NULL-org row is now filtered out of
+    // the update's scan before any new row is formed. The statement therefore
+    // affects zero rows instead of erroring — the same shape a cross-tenant
+    // `UPDATE "Customer"` has, and a stricter outcome than before: it no longer
+    // matters what the new row looks like. See the fix-round-2 block below.
+    expect(thrown).toBeUndefined()
+    expect(affected).toBe(0)
 
     const after = await rawPrisma.role.findUniqueOrThrow({ where: { id: systemRoleId } })
     expect(after.name).toBe(before.name)
@@ -1661,6 +1678,380 @@ describe('Role/RolePermission writes cannot reach the platform system role (fix 
     expect(seen.permRoleIds).toContain(A.roleId)
     expect(seen.permRoleIds).not.toContain(B.roleId)
   })
+})
+
+// -----------------------------------------------------------------------------
+// Fix Round 2, finding 1 — the OLD-row half of UPDATE on Role / RolePermission.
+//
+// Round 1 tightened the row an UPDATE *produces* (WITH CHECK) and closed DELETE
+// (a RESTRICTIVE FOR DELETE policy). It never tightened the clause that decides
+// whether the OLD, pre-update row is eligible to be touched at all: UPDATE's
+// USING, which was still the permissive read predicate. So an UPDATE whose old
+// row was the NULL-org platform role and whose new row was owned by the caller
+// satisfied every round-1 predicate — both ends individually legal, the
+// combination an escalation. Measured live after both round-1 migrations, under
+// `SET LOCAL ROLE authenticated`:
+//
+//   UPDATE "Role" SET "organizationId" = '<own org>' WHERE "organizationId" IS NULL;  -> 1 row
+//   UPDATE "RolePermission" SET "roleId" = '<own role>' WHERE "roleId" = '<platform>'; -> 1 row
+//
+// 20260911201237_restrict_platform_role_updates adds the UPDATE analogue of the
+// round-1 DELETE policy: RESTRICTIVE, FOR UPDATE, strict USING. Both halves of
+// an UPDATE are now independently guarded, and the tests below prove each one
+// separately — old-row rejection (silent zero rows) and new-row rejection (an
+// explicit RLS error) — plus the two controls that keep this from being a
+// blanket deny: own-tenant UPDATEs still work, and SELECT is untouched.
+// -----------------------------------------------------------------------------
+describe('Role/RolePermission UPDATE cannot touch platform rows (fix round 2)', () => {
+  it('a RESTRICTIVE, UPDATE-only policy now guards the old row', async () => {
+    const rows = await rawPrisma.$queryRawUnsafe<
+      {
+        tablename: string
+        cmd: string
+        permissive: string
+        roles: string
+        qual: string
+        with_check: string | null
+      }[]
+    >(
+      `SELECT tablename, cmd, permissive, roles::text AS roles, qual, with_check FROM pg_policies
+        WHERE schemaname='public' AND policyname='tenant_update_isolation' ORDER BY tablename`
+    )
+    console.log('[rls-security] update-restriction policies:', rows)
+    expect(rows.map((r) => r.tablename)).toEqual(['Role', 'RolePermission'])
+    for (const r of rows) {
+      expect(r.permissive, `${r.tablename}.permissive`).toBe('RESTRICTIVE')
+      // UPDATE only — SELECT, INSERT and DELETE behaviour is provably untouched.
+      expect(r.cmd, `${r.tablename}.cmd`).toBe('UPDATE')
+      expect(r.roles, `${r.tablename}.roles`).toBe('{public}')
+      expect(r.qual, `${r.tablename}.qual`).toMatch(/current_setting\('app\.current_tenant_id'/)
+      // The whole point: no NULL-org allowance on the old row.
+      expect(r.qual, `${r.tablename}.qual`).not.toMatch(/IS NULL/)
+      // Postgres does not mirror a restrictive FOR UPDATE USING into a
+      // restrictive WITH CHECK, so the new-row check is exactly what round 1
+      // left it — verified here rather than assumed.
+      expect(r.with_check, `${r.tablename}.with_check`).toBeNull()
+    }
+  })
+
+  it('a tenant cannot adopt the NULL-org platform Role by UPDATE (old-row rejection)', async () => {
+    // The exact statement an independent reviewer ran against the round-1 state,
+    // where it reported rowCount 1. Old row passed the permissive USING; new row
+    // (now owned by A) passed the strict WITH CHECK.
+    const affected = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(
+        `UPDATE "Role" SET "organizationId" = '${A.orgId}' WHERE "id" = '${systemRoleId}'`
+      )
+    )
+    console.log('[rls-security] platform-role adoption UPDATE affected:', affected)
+    // Silent zero rows, not an error: the restrictive policy filters the old row
+    // out of the update's scan before WITH CHECK is ever consulted.
+    expect(affected).toBe(0)
+
+    const unchanged = await rawPrisma.role.findUniqueOrThrow({ where: { id: systemRoleId } })
+    expect(unchanged.organizationId).toBeNull()
+  })
+
+  it('the same adoption phrased as an unkeyed WHERE ... IS NULL also affects zero rows', async () => {
+    // Phrasing matters: this form does not name the platform role's id at all,
+    // so it cannot be dismissed as "the attacker had to know the id".
+    const affected = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(
+        `UPDATE "Role" SET "organizationId" = '${A.orgId}' WHERE "organizationId" IS NULL`
+      )
+    )
+    console.log('[rls-security] unkeyed platform-role adoption UPDATE affected:', affected)
+    expect(affected).toBe(0)
+
+    const stillPlatform = await rawPrisma.role.findUniqueOrThrow({ where: { id: systemRoleId } })
+    expect(stillPlatform.organizationId).toBeNull()
+  })
+
+  it("a tenant cannot re-parent the platform role's RolePermission onto its own role", async () => {
+    // Reported rowCount 1 against the round-1 state. Re-parenting strips the
+    // grant from the platform role AND hands it to the tenant in one statement.
+    const before = await rawPrisma.rolePermission.findMany({ where: { roleId: systemRoleId } })
+    expect(before.length).toBeGreaterThan(0)
+
+    const affected = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(
+        `UPDATE "RolePermission" SET "roleId" = '${A.roleId}' WHERE "roleId" = '${systemRoleId}'`
+      )
+    )
+    console.log('[rls-security] RolePermission re-parenting UPDATE affected:', affected)
+    expect(affected).toBe(0)
+
+    const after = await rawPrisma.rolePermission.findMany({ where: { roleId: systemRoleId } })
+    expect(after.length).toBe(before.length)
+  })
+
+  it("a tenant cannot UPDATE another tenant's Role or RolePermission either", async () => {
+    // The old row is not merely NULL-org-exempt — it must be the caller's own.
+    const roleAffected = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(`UPDATE "Role" SET "name" = 'HACKED' WHERE "id" = '${B.roleId}'`)
+    )
+    expect(roleAffected).toBe(0)
+
+    const permAffected = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(
+        `UPDATE "RolePermission" SET "roleId" = '${A.roleId}' WHERE "roleId" = '${B.roleId}'`
+      )
+    )
+    expect(permAffected).toBe(0)
+
+    const unchanged = await rawPrisma.role.findUniqueOrThrow({ where: { id: B.roleId } })
+    expect(unchanged.name).not.toBe('HACKED')
+    const bPerms = await rawPrisma.rolePermission.findMany({ where: { roleId: B.roleId } })
+    expect(bPerms.length).toBeGreaterThan(0)
+  })
+
+  it('the NEW-row check still fires independently of the new old-row check', async () => {
+    // Complement of the tests above: here the OLD row IS the caller's own, so
+    // the new RESTRICTIVE FOR UPDATE policy admits it — and the update is still
+    // refused, by round 1's strict WITH CHECK on the row it would produce. Both
+    // halves are therefore proven to work on their own, not one masking the
+    // other.
+    let thrown: Error | undefined
+    try {
+      await asTenant(A.orgId, (tx) =>
+        tx.$executeRawUnsafe(`UPDATE "Role" SET "organizationId" = NULL WHERE "id" = '${A.roleId}'`)
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+    console.log(
+      '[rls-security] own-row -> NULL-org UPDATE:',
+      thrown?.message.split('\n').slice(-1).join('')
+    )
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/row-level security/i)
+
+    const unchanged = await rawPrisma.role.findUniqueOrThrow({ where: { id: A.roleId } })
+    expect(unchanged.organizationId).toBe(A.orgId)
+  })
+
+  it('own-tenant UPDATEs still succeed (not a blanket deny)', async () => {
+    const ownRoleId = fakeCuid()
+    await rawPrisma.role.create({
+      data: { id: ownRoleId, organizationId: A.orgId, name: `ROUND2 OWN ${stamp}`, isSystemRole: false },
+    })
+    await rawPrisma.rolePermission.create({ data: { roleId: ownRoleId, permissionId } })
+
+    const renamed = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(
+        `UPDATE "Role" SET "name" = 'ROUND2 RENAMED ${stamp}' WHERE "id" = '${ownRoleId}'`
+      )
+    )
+    expect(renamed).toBe(1)
+
+    // A RolePermission UPDATE that moves a grant between two roles the tenant
+    // owns: old row in scope, new row in scope, so both clauses admit it.
+    const moved = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(
+        `UPDATE "RolePermission" SET "roleId" = '${ownRoleId}' WHERE "roleId" = '${ownRoleId}'`
+      )
+    )
+    expect(moved).toBe(1)
+
+    const after = await rawPrisma.role.findUniqueOrThrow({ where: { id: ownRoleId } })
+    expect(after.name).toBe(`ROUND2 RENAMED ${stamp}`)
+
+    await rawPrisma.rolePermission.deleteMany({ where: { roleId: ownRoleId } })
+    await rawPrisma.role.deleteMany({ where: { id: ownRoleId } })
+  }, 60_000)
+
+  it('SELECT visibility of the NULL-org platform role is completely unchanged', async () => {
+    // The half that must not have moved. A FOR UPDATE policy is never consulted
+    // for SELECT, but this is the assertion that makes that a measurement rather
+    // than a claim.
+    const seen = await asTenant(A.orgId, async (tx) => {
+      const roles = await tx.$queryRawUnsafe<{ id: string; organizationId: string | null }[]>(
+        `SELECT "id","organizationId" FROM "Role"`
+      )
+      const perms = await tx.$queryRawUnsafe<{ roleId: string }[]>(
+        `SELECT "roleId" FROM "RolePermission"`
+      )
+      return { roleIds: roles.map((r) => r.id), permRoleIds: perms.map((p) => p.roleId) }
+    })
+    expect(seen.roleIds).toContain(systemRoleId)
+    expect(seen.roleIds).toContain(A.roleId)
+    expect(seen.roleIds).not.toContain(B.roleId)
+    expect(seen.permRoleIds).toContain(systemRoleId)
+    expect(seen.permRoleIds).toContain(A.roleId)
+    expect(seen.permRoleIds).not.toContain(B.roleId)
+  })
+})
+
+// -----------------------------------------------------------------------------
+// Fix Round 2, finding 2 — MembershipPlanService / MembershipPlanBranch must
+// match the tenant on BOTH ends of the link.
+//
+// The original policies resolved the row's tenant through "MembershipPlan" only.
+// Each of these tables has two foreign keys, and the second one was entirely
+// unchecked, so a tenant could link its own plan to another tenant's Service or
+// Branch (measured: rowCount 1 for both). Not a read leak — the row stays scoped
+// to the caller's own plan — but a durable cross-tenant reference no application
+// path can produce legitimately.
+// 20260911201510_fix_membership_plan_join_tenant_matching ANDs a second EXISTS
+// onto each predicate.
+// -----------------------------------------------------------------------------
+describe('MembershipPlan join tables match the tenant on both ends (fix round 2)', () => {
+  /** A spare plan for A, so control INSERTs do not collide with the fixture PKs. */
+  let sparePlanId: string
+
+  beforeAll(async () => {
+    const plan = await rawPrisma.membershipPlan.create({
+      data: {
+        organizationId: A.orgId,
+        name: `RLS a spare plan ${stamp}`,
+        price: new Prisma.Decimal('49.00'),
+        durationValue: 1,
+        durationUnit: 'MONTHLY',
+      },
+    })
+    sparePlanId = plan.id
+  }, 120_000)
+
+  afterAll(async () => {
+    try {
+      await rawPrisma.membershipPlanService.deleteMany({ where: { membershipPlanId: sparePlanId } })
+      await rawPrisma.membershipPlanBranch.deleteMany({ where: { membershipPlanId: sparePlanId } })
+      await rawPrisma.membershipPlan.deleteMany({ where: { id: sparePlanId } })
+    } catch (error) {
+      console.warn('[rls-security] round-2 join-table teardown skipped:', (error as Error).message)
+    }
+  }, 120_000)
+
+  it('both policies now test the linked Service/Branch as well as the plan', async () => {
+    const rows = await rawPrisma.$queryRawUnsafe<{ tablename: string; qual: string }[]>(
+      `SELECT tablename, qual FROM pg_policies
+        WHERE schemaname='public' AND policyname='tenant_isolation'
+          AND tablename IN ('MembershipPlanService','MembershipPlanBranch') ORDER BY tablename`
+    )
+    console.log('[rls-security] join-table policies:', rows)
+    expect(rows.map((r) => r.tablename)).toEqual(['MembershipPlanBranch', 'MembershipPlanService'])
+    const byTable = new Map(rows.map((r) => [r.tablename, r.qual]))
+    expect(byTable.get('MembershipPlanService')).toMatch(/FROM "MembershipPlan"/)
+    expect(byTable.get('MembershipPlanService')).toMatch(/FROM "Service"/)
+    expect(byTable.get('MembershipPlanBranch')).toMatch(/FROM "MembershipPlan"/)
+    expect(byTable.get('MembershipPlanBranch')).toMatch(/FROM "Branch"/)
+  })
+
+  it("a tenant cannot link its own plan to another tenant's Service", async () => {
+    let thrown: Error | undefined
+    try {
+      await asTenant(A.orgId, (tx) =>
+        tx.$executeRawUnsafe(
+          `INSERT INTO "MembershipPlanService" ("membershipPlanId","serviceId")
+           VALUES ('${sparePlanId}', '${B.serviceId}')`
+        )
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+    console.log(
+      '[rls-security] cross-tenant plan->service link:',
+      thrown?.message.split('\n').slice(-1).join('')
+    )
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/row-level security/i)
+
+    const landed = await rawPrisma.membershipPlanService.findMany({
+      where: { membershipPlanId: sparePlanId, serviceId: B.serviceId },
+    })
+    expect(landed).toEqual([])
+  })
+
+  it("a tenant cannot link its own plan to another tenant's Branch", async () => {
+    let thrown: Error | undefined
+    try {
+      await asTenant(A.orgId, (tx) =>
+        tx.$executeRawUnsafe(
+          `INSERT INTO "MembershipPlanBranch" ("membershipPlanId","branchId")
+           VALUES ('${sparePlanId}', '${B.branchId}')`
+        )
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+    console.log(
+      '[rls-security] cross-tenant plan->branch link:',
+      thrown?.message.split('\n').slice(-1).join('')
+    )
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/row-level security/i)
+
+    const landed = await rawPrisma.membershipPlanBranch.findMany({
+      where: { membershipPlanId: sparePlanId, branchId: B.branchId },
+    })
+    expect(landed).toEqual([])
+  })
+
+  it('the same links to the tenant\'s OWN Service and Branch still succeed', async () => {
+    // Control: identical statements, same-tenant targets. Without this the two
+    // rejections above could be a blanket deny rather than a tenant match.
+    const linkedService = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(
+        `INSERT INTO "MembershipPlanService" ("membershipPlanId","serviceId")
+         VALUES ('${sparePlanId}', '${A.serviceId}')`
+      )
+    )
+    expect(linkedService).toBe(1)
+
+    const linkedBranch = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(
+        `INSERT INTO "MembershipPlanBranch" ("membershipPlanId","branchId")
+         VALUES ('${sparePlanId}', '${A.branchId}')`
+      )
+    )
+    expect(linkedBranch).toBe(1)
+
+    // And they are readable by their own tenant afterwards.
+    const visible = await asTenant(A.orgId, async (tx) => ({
+      services: await tx.membershipPlanService.findMany({ where: { membershipPlanId: sparePlanId } }),
+      branches: await tx.membershipPlanBranch.findMany({ where: { membershipPlanId: sparePlanId } }),
+    }))
+    expect(visible.services.map((r) => r.serviceId)).toEqual([A.serviceId])
+    expect(visible.branches.map((r) => r.branchId)).toEqual([A.branchId])
+
+    await rawPrisma.membershipPlanService.deleteMany({ where: { membershipPlanId: sparePlanId } })
+    await rawPrisma.membershipPlanBranch.deleteMany({ where: { membershipPlanId: sparePlanId } })
+  }, 60_000)
+
+  it("an UPDATE cannot swing an existing link onto another tenant's Service", async () => {
+    // The verb the INSERT tests do not cover: re-pointing a link row the tenant
+    // legitimately owns at a foreign Service. The old row is in scope, so this is
+    // purely a test of the widened WITH CHECK (Postgres reuses USING for it,
+    // since these policies state no explicit WITH CHECK).
+    await rawPrisma.membershipPlanService.create({
+      data: { membershipPlanId: sparePlanId, serviceId: A.serviceId },
+    })
+
+    let thrown: Error | undefined
+    try {
+      await asTenant(A.orgId, (tx) =>
+        tx.$executeRawUnsafe(
+          `UPDATE "MembershipPlanService" SET "serviceId" = '${B.serviceId}'
+            WHERE "membershipPlanId" = '${sparePlanId}'`
+        )
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+    console.log(
+      '[rls-security] cross-tenant plan->service re-point:',
+      thrown?.message.split('\n').slice(-1).join('')
+    )
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/row-level security/i)
+
+    const stillOwn = await rawPrisma.membershipPlanService.findMany({
+      where: { membershipPlanId: sparePlanId },
+    })
+    expect(stillOwn.map((r) => r.serviceId)).toEqual([A.serviceId])
+
+    await rawPrisma.membershipPlanService.deleteMany({ where: { membershipPlanId: sparePlanId } })
+  }, 60_000)
 })
 
 // -----------------------------------------------------------------------------
