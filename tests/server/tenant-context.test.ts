@@ -71,7 +71,14 @@ describe('withTenantContext', () => {
     expect(visibleToA.length).toBeGreaterThan(0)
     expect(visibleToA.every((c) => c.organizationId === orgA.id)).toBe(true)
     expect(visibleToA.some((c) => c.organizationId === orgB.id)).toBe(false)
-  })
+    // Explicit timeout: this test makes ~7 sequential round trips (2 orgs, 2
+    // users, 2 tenant-context writes, 1 tenant-context read) against a live,
+    // remote Supabase pooler, where a single round trip costs hundreds of
+    // milliseconds — that exceeds vitest's 5s default on a cold connection, and
+    // was observed to do so when the whole suite runs. Matches the 30s pattern
+    // already used in tests/db/rbac-schema.test.ts and
+    // tests/db/tenant-access-boundary.test.ts.
+  }, 30_000)
 
   it('cannot be bypassed: prisma.customer throws before any query runs', () => {
     expect(() => (prisma as unknown as { customer: unknown }).customer).toThrow()
@@ -92,5 +99,46 @@ describe('withTenantContext', () => {
       `SELECT current_setting('app.current_tenant_id', true)`
     )
     expect(afterCommit[0].current_setting).not.toBe(org.id)
-  })
+  }, 30_000)
+
+  it('accepts Prisma $transaction options so a slow callback can outlive the 5s default', async () => {
+    const org = await prisma.organization.create({
+      data: { name: 'Tx Timeout Test', slug: `txt-${Date.now()}` },
+    })
+
+    // Prisma's interactive-transaction default `timeout` is 5000ms. A callback
+    // that deliberately sleeps 7s therefore cannot complete on the default, and
+    // can on a raised one. Both halves are asserted, so the test proves the new
+    // parameter is actually wired through rather than merely accepted.
+    const started = Date.now()
+    const observed = await withTenantContext(
+      org.id,
+      async (tx) => {
+        await tx.$executeRawUnsafe(`SELECT pg_sleep(7)`)
+        const rows = await tx.$queryRawUnsafe<{ current_setting: string }[]>(
+          `SELECT current_setting('app.current_tenant_id', true)`
+        )
+        return rows[0].current_setting
+      },
+      { maxWait: 30_000, timeout: 60_000 }
+    )
+    const elapsed = Date.now() - started
+    expect(observed).toBe(org.id)
+    expect(elapsed).toBeGreaterThan(5_000)
+
+    // The control: the identical callback with no options must fail on the
+    // stock 5s budget, with Prisma's transaction-timeout error (P2028).
+    let thrown: Error | undefined
+    try {
+      await withTenantContext(org.id, async (tx) => {
+        await tx.$executeRawUnsafe(`SELECT pg_sleep(7)`)
+        return 'should not get here'
+      })
+    } catch (error) {
+      thrown = error as Error
+    }
+    console.log('[tenant-context] default-timeout error:', thrown?.message.split('\n').slice(-2).join(' | '))
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/transaction|P2028|timeout/i)
+  }, 120_000)
 })

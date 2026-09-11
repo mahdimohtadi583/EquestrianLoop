@@ -41,7 +41,29 @@ const connectionString = resolveConnectionString(process.env)
 export const rawPrisma =
   globalForPrisma.rawPrisma ??
   new PrismaClient({
-    adapter: new PrismaPg(new Pool({ connectionString })),
+    adapter: new PrismaPg(
+      new Pool({
+        connectionString,
+        // `pg`'s default connectionTimeoutMillis is 0, which means "wait
+        // forever". With a bounded pool that turns a starved pool — or a
+        // pooler/network stall — into a request that hangs indefinitely with no
+        // error, no log line and no way for a caller's own timeout to attribute
+        // the fault. Bounding it converts that into a prompt, explicit
+        // "timeout exceeded when trying to connect".
+        //
+        // 10s, reasoned rather than picked: this is a *remote* Supabase
+        // transaction-mode pooler, so the budget has to cover a genuine cold
+        // acquire — TCP + TLS handshake + pooler-side backend assignment over
+        // WAN latency, which is comfortably under 2s here but can spike on a
+        // cold Supabase instance. Anything in the 1-3s range would turn normal
+        // cold starts into spurious failures. It also has to stay well under
+        // the time a human or an upstream request handler will wait, and under
+        // Prisma's own `maxWait` queueing budget, so the pool is the layer that
+        // reports the problem. 10s sits between those two bounds and matches
+        // the conventional default for a remote Postgres pool.
+        connectionTimeoutMillis: 10_000,
+      })
+    ),
   })
 
 if (process.env.NODE_ENV !== 'production') {

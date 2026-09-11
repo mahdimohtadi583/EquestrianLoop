@@ -81,6 +81,19 @@ export function assertValidOrganizationId(organizationId: unknown): string {
  * 2's platform-scoped client (`prisma` from '@/db/client') does not expose one,
  * and throws rather than returning undefined if you try.
  *
+ * WHAT `tx` IS, PRECISELY — do not over-read the sentence above. `tx` is the
+ * FULL, unrestricted Prisma transaction client, not a tenant-scoped subset of
+ * it. `tx.user`, `tx.organization`, `tx.subscription`, `tx.auditLog`, every
+ * other platform model, and the raw-SQL escape hatches (`tx.$queryRaw*`,
+ * `tx.$executeRaw*`) are all reachable from inside the callback and are all
+ * completely unfiltered by RLS, because those tables deliberately carry no
+ * `tenant_isolation` policy (see the DELIBERATELY NOT COVERED section of
+ * prisma/migrations/*_enable_rls/migration.sql — Task 2's platform models are
+ * meant to be readable regardless of tenant context). What the tenant context
+ * scopes is the set of tables that *have* a policy; it does not extend to
+ * everything reachable through `tx`. Callers touching platform models inside
+ * the callback are responsible for their own authorization.
+ *
  * `SET LOCAL` is transaction-scoped: the setting is discarded at COMMIT and at
  * ROLLBACK alike, so a pooled connection handed to the next caller never
  * carries a previous tenant's context. A transaction that never issues the
@@ -98,17 +111,39 @@ export function assertValidOrganizationId(organizationId: unknown): string {
  * change. See the Task 9 report; tests/db/rls-security.test.ts proves the
  * policies themselves enforce correctly by running under a role that is subject
  * to them.
+ *
+ * @param options forwarded verbatim to Prisma's interactive-`$transaction`
+ *   options. Omitting it leaves Prisma's own defaults in force — `maxWait`
+ *   2000ms (how long the call queues for a free pooled connection) and
+ *   `timeout` 5000ms (how long the whole transaction, including everything
+ *   `fn` does, may run) — which is exactly the behaviour every existing
+ *   two-argument caller had before this parameter existed. Nothing is defaulted
+ *   on their behalf here, deliberately: silently widening the timeout for all
+ *   callers would hide real runaway transactions.
+ *
+ *   Pass it when the callback genuinely needs longer. That is not hypothetical
+ *   on this deployment: the database is a remote Supabase pooler where a single
+ *   round trip costs hundreds of milliseconds, so ~3 sequential statements
+ *   already spend ~3s of the 5s budget, and nesting `withTenantContext` (each
+ *   level holding its own connection for the nested duration) reliably trips
+ *   `P2028` at depth ~9-11 — the *outer* transaction timing out, before the
+ *   pool is even exhausted. `{ maxWait: 30_000, timeout: 60_000 }` is the shape
+ *   the live-DB tests in this repo use.
  */
 export async function withTenantContext<T>(
   organizationId: string,
-  fn: (tx: Prisma.TransactionClient) => Promise<T>
+  fn: (tx: Prisma.TransactionClient) => Promise<T>,
+  options?: { maxWait?: number; timeout?: number; isolationLevel?: Prisma.TransactionIsolationLevel }
 ): Promise<T> {
   // Validate BEFORE opening the transaction, so a malformed id costs no
   // connection and no SQL text is ever built from it.
   const validated = assertValidOrganizationId(organizationId)
 
+  // `options` is passed straight through — `undefined` is what
+  // `$transaction(fn)` would have received anyway, so the two-argument call
+  // path is byte-for-byte the same behaviour it was.
   return rawPrisma.$transaction(async (tx) => {
     await tx.$executeRawUnsafe(`SET LOCAL app.current_tenant_id = '${validated.replace(/'/g, "''")}'`)
     return fn(tx)
-  })
+  }, options)
 }

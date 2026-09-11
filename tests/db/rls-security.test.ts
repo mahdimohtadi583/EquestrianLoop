@@ -60,11 +60,17 @@ import {
 vi.setConfig({ testTimeout: 120_000, hookTimeout: 240_000 })
 
 /**
- * Options for the raw `$transaction` helpers below. `maxWait` is how long
- * Prisma will queue for a free connection and `timeout` how long the
- * transaction may run — both generous for the same latency reason.
- * (`withTenantContext` keeps Prisma's defaults; its signature is fixed by the
- * task brief, so the tests that use it are written to be short instead.)
+ * Options for the `$transaction` helpers below. `maxWait` is how long Prisma
+ * will queue for a free connection (default 2000ms) and `timeout` how long the
+ * transaction may run (default 5000ms) — both raised generously for the same
+ * remote-latency reason.
+ *
+ * Fix round 1: `withTenantContext` now takes these as an optional third
+ * argument, so `asTenant` passes them through rather than silently running on
+ * Prisma's defaults. That is not cosmetic — on Prisma's stock `maxWait` of
+ * 2000ms this suite's concurrent blocks intermittently failed with
+ * `Transaction API error: Unable to start a transaction in the given time`
+ * against this remote pooler, which is the flakiness finding 2 describes.
  */
 const TX_OPTIONS = { maxWait: 30_000, timeout: 60_000 } as const
 
@@ -76,10 +82,14 @@ function asTenant<T>(
   organizationId: string,
   fn: (tx: Prisma.TransactionClient) => Promise<T>
 ): Promise<T> {
-  return withTenantContext(organizationId, async (tx) => {
-    await tx.$executeRawUnsafe(ENFORCE_RLS)
-    return fn(tx)
-  })
+  return withTenantContext(
+    organizationId,
+    async (tx) => {
+      await tx.$executeRawUnsafe(ENFORCE_RLS)
+      return fn(tx)
+    },
+    TX_OPTIONS
+  )
 }
 
 /** RLS-subject role, and no tenant context is ever set on the transaction. */
@@ -384,12 +394,16 @@ describe('runtime role privileges (security item 18)', () => {
     // tenant context, and see whether other tenants' rows come back. This is the
     // empirical counterpart to the pg_roles reading above: whichever way the
     // deployment is configured, the two must agree.
-    const leakedAsRuntimeRole = await withTenantContext(A.orgId, async (tx) => {
-      const rows = await tx.$queryRawUnsafe<{ count: number }[]>(
-        `SELECT count(*)::int AS count FROM "Customer" WHERE "organizationId" = '${B.orgId}'`
-      )
-      return rows[0].count > 0
-    })
+    const leakedAsRuntimeRole = await withTenantContext(
+      A.orgId,
+      async (tx) => {
+        const rows = await tx.$queryRawUnsafe<{ count: number }[]>(
+          `SELECT count(*)::int AS count FROM "Customer" WHERE "organizationId" = '${B.orgId}'`
+        )
+        return rows[0].count > 0
+      },
+      TX_OPTIONS
+    )
 
     const bypasses = runtimeRole.rolsuper || runtimeRole.rolbypassrls
     console.log(
@@ -801,7 +815,7 @@ describe('context isolation across connections and transactions (security items 
             `SELECT current_setting('app.current_tenant_id', true)`
           )
           return { expected: id, first: first[0].current_setting, second: second[0].current_setting }
-        })
+        }, TX_OPTIONS)
       )
     )
     console.log('[rls-security] concurrent contexts:', results)
@@ -839,7 +853,7 @@ describe('context isolation across connections and transactions (security items 
           `SELECT current_setting('app.current_tenant_id', true)`
         )
         return rows[0].current_setting
-      })
+      }, TX_OPTIONS)
       expect(inside).toBe(org)
 
       // A separate query, outside any withTenantContext — it may well land on
@@ -877,7 +891,7 @@ describe('context isolation across connections and transactions (security items 
            VALUES ('${doomedCustomerId}', '${A.orgId}', '${doomedUser.id}', '${fakeCuid()}', 'Doomed', 'Row')`
         )
         throw new Error('deliberate failure, forcing ROLLBACK')
-      })
+      }, TX_OPTIONS)
     ).rejects.toThrow('deliberate failure')
 
     // The write was rolled back...
@@ -936,7 +950,7 @@ describe('nested withTenantContext (security item 12)', () => {
           `SELECT "organizationId" FROM "Customer"`
         )
         return { setting: seen.setting, pid: seen.pid, rows }
-      })
+      }, TX_OPTIONS)
 
       const after = await one<{ setting: string }>(
         outerTx,
@@ -954,7 +968,7 @@ describe('nested withTenantContext (security item 12)', () => {
         inner,
         outerRows,
       }
-    })
+    }, TX_OPTIONS)
 
     console.log('[rls-security] nested contexts:', {
       outerBefore: result.outerBefore,
@@ -1078,7 +1092,11 @@ describe('RLS coverage of tenant-scoped tables (security items 13 and 14)', () =
       expect(state, `${table} has no pg_class row`).toBeDefined()
       expect(state!.rls, `${table} rowsecurity`).toBe(true)
       expect(state!.force, `${table} force rowsecurity`).toBe(true)
-      expect(state!.policies, `${table} policy count`).toBe(1)
+      // One permissive `tenant_isolation` policy each — plus, on
+      // RolePermission only, the RESTRICTIVE FOR DELETE `tenant_delete_isolation`
+      // policy added by 20260911185927_restrict_platform_role_deletes (see the
+      // "Role/RolePermission writes" block below for why).
+      expect(state!.policies, `${table} policy count`).toBe(table === 'RolePermission' ? 2 : 1)
     }
     // And their predicates really are EXISTS subqueries against the parent.
     const quals = await rawPrisma.$queryRawUnsafe<{ tablename: string; qual: string }[]>(
@@ -1152,7 +1170,9 @@ describe('RLS coverage of tenant-scoped tables (security items 13 and 14)', () =
     for (const table of ['Branch', 'Membership', 'Role'] as const) {
       expect(actual.get(table)?.rls, `${table} rowsecurity`).toBe(true)
       expect(actual.get(table)?.force, `${table} force rowsecurity`).toBe(true)
-      expect(actual.get(table)?.policies, `${table} policy count`).toBe(1)
+      // Role additionally carries the RESTRICTIVE FOR DELETE policy from
+      // 20260911185927_restrict_platform_role_deletes.
+      expect(actual.get(table)?.policies, `${table} policy count`).toBe(table === 'Role' ? 2 : 1)
     }
   })
 })
@@ -1303,6 +1323,344 @@ describe('join/extension tables cannot bypass isolation (security item 15)', () 
     expect(thrown).toBeDefined()
     expect(thrown!.message).toMatch(/row-level security/i)
   })
+
+  // ---------------------------------------------------------------------------
+  // Fix Round 1, finding 5: MembershipPlanService / MembershipPlanBranch reached
+  // through the Prisma delegate with no join and no where clause, against real
+  // rows created for both tenants in beforeAll. Structurally identical to the
+  // Trainer delegate test above, so these two join tables are now exercised
+  // against actual data rather than verified only by policy text + RLS state.
+  // ---------------------------------------------------------------------------
+  it('MembershipPlanService, via the Prisma delegate, is filtered per tenant', async () => {
+    const [fromA, fromB] = await Promise.all([
+      asTenant(A.orgId, (tx) => tx.membershipPlanService.findMany()),
+      asTenant(B.orgId, (tx) => tx.membershipPlanService.findMany()),
+    ])
+    console.log('[rls-security] MembershipPlanService delegate rows:', {
+      A: fromA.length,
+      B: fromB.length,
+    })
+    // Real rows exist on both sides — otherwise "not visible" would be vacuous.
+    expect(fromA.length).toBeGreaterThan(0)
+    expect(fromB.length).toBeGreaterThan(0)
+    expect(fromA.map((r) => r.membershipPlanId)).toContain(A.planId)
+    expect(fromA.map((r) => r.membershipPlanId)).not.toContain(B.planId)
+    expect(fromA.map((r) => r.serviceId)).not.toContain(B.serviceId)
+    expect(fromB.map((r) => r.membershipPlanId)).toContain(B.planId)
+    expect(fromB.map((r) => r.membershipPlanId)).not.toContain(A.planId)
+    expect(fromB.map((r) => r.serviceId)).not.toContain(A.serviceId)
+  })
+
+  it('MembershipPlanBranch, via the Prisma delegate, is filtered per tenant', async () => {
+    const [fromA, fromB] = await Promise.all([
+      asTenant(A.orgId, (tx) => tx.membershipPlanBranch.findMany()),
+      asTenant(B.orgId, (tx) => tx.membershipPlanBranch.findMany()),
+    ])
+    console.log('[rls-security] MembershipPlanBranch delegate rows:', {
+      A: fromA.length,
+      B: fromB.length,
+    })
+    expect(fromA.length).toBeGreaterThan(0)
+    expect(fromB.length).toBeGreaterThan(0)
+    expect(fromA.map((r) => r.branchId)).toContain(A.branchId)
+    expect(fromA.map((r) => r.branchId)).not.toContain(B.branchId)
+    expect(fromB.map((r) => r.branchId)).toContain(B.branchId)
+    expect(fromB.map((r) => r.branchId)).not.toContain(A.branchId)
+  })
+
+  it('both join tables genuinely hold rows for both tenants (the fixtures are not empty)', async () => {
+    // Read as the bypassing runtime role, so this is a statement about the
+    // database, not about what RLS lets anyone see. Guards against the previous
+    // state of affairs, in which these two policies were asserted against zero
+    // rows.
+    const rows = await rawPrisma.$queryRawUnsafe<
+      { aServices: number; bServices: number; aBranches: number; bBranches: number }[]
+    >(
+      `SELECT
+         (SELECT count(*)::int FROM "MembershipPlanService" WHERE "membershipPlanId" = '${A.planId}') AS "aServices",
+         (SELECT count(*)::int FROM "MembershipPlanService" WHERE "membershipPlanId" = '${B.planId}') AS "bServices",
+         (SELECT count(*)::int FROM "MembershipPlanBranch"  WHERE "membershipPlanId" = '${A.planId}') AS "aBranches",
+         (SELECT count(*)::int FROM "MembershipPlanBranch"  WHERE "membershipPlanId" = '${B.planId}') AS "bBranches"`
+    )
+    console.log('[rls-security] join-table fixture row counts:', rows[0])
+    expect(rows[0].aServices).toBe(1)
+    expect(rows[0].bServices).toBe(1)
+    expect(rows[0].aBranches).toBe(1)
+    expect(rows[0].bBranches).toBe(1)
+  })
+})
+
+// -----------------------------------------------------------------------------
+// Fix Round 1, finding 1 — Role / RolePermission WRITE hardening.
+//
+// The original migration gave both policies a USING clause only, so Postgres
+// reused the deliberately permissive read predicate (`organizationId IS NULL OR
+// ...`) as the WITH CHECK expression. That let any single valid tenant context
+// grant itself platform scope. Migration 20260911185229_harden_role_write_policies
+// splits the two: USING unchanged (reads must keep seeing NULL-org system
+// roles), WITH CHECK strict (writes must match the active tenant exactly).
+//
+// Every test below therefore comes in two halves: the write is refused, AND the
+// corresponding read still works.
+// -----------------------------------------------------------------------------
+describe('Role/RolePermission writes cannot reach the platform system role (fix round 1)', () => {
+  it('the two policies now carry an explicit, strict WITH CHECK', async () => {
+    const rows = await rawPrisma.$queryRawUnsafe<
+      { tablename: string; qual: string; with_check: string | null }[]
+    >(
+      `SELECT tablename, qual, with_check FROM pg_policies
+        WHERE schemaname='public' AND policyname='tenant_isolation'
+          AND tablename IN ('Role','RolePermission') ORDER BY tablename`
+    )
+    console.log('[rls-security] hardened policies:', rows)
+    expect(rows.length).toBe(2)
+    const byTable = new Map(rows.map((r) => [r.tablename, r]))
+
+    // READ side: unchanged, still permits the NULL-org platform role.
+    expect(byTable.get('Role')!.qual).toMatch(/"organizationId" IS NULL/)
+    expect(byTable.get('RolePermission')!.qual).toMatch(/"organizationId" IS NULL/)
+
+    // WRITE side: present, and containing no IS NULL allowance at all.
+    expect(byTable.get('Role')!.with_check).not.toBeNull()
+    expect(byTable.get('RolePermission')!.with_check).not.toBeNull()
+    expect(byTable.get('Role')!.with_check).not.toMatch(/IS NULL/)
+    expect(byTable.get('RolePermission')!.with_check).not.toMatch(/IS NULL/)
+    expect(byTable.get('Role')!.with_check).toMatch(/current_setting\('app\.current_tenant_id'/)
+    expect(byTable.get('RolePermission')!.with_check).toMatch(
+      /current_setting\('app\.current_tenant_id'/
+    )
+  })
+
+  it('a RESTRICTIVE, DELETE-only policy covers the verb WITH CHECK cannot reach', async () => {
+    const rows = await rawPrisma.$queryRawUnsafe<
+      { tablename: string; cmd: string; permissive: string; roles: string; qual: string }[]
+    >(
+      `SELECT tablename, cmd, permissive, roles::text AS roles, qual FROM pg_policies
+        WHERE schemaname='public' AND policyname='tenant_delete_isolation' ORDER BY tablename`
+    )
+    console.log('[rls-security] delete-restriction policies:', rows)
+    expect(rows.map((r) => r.tablename)).toEqual(['Role', 'RolePermission'])
+    for (const r of rows) {
+      expect(r.permissive, `${r.tablename}.permissive`).toBe('RESTRICTIVE')
+      // DELETE only — so SELECT/INSERT/UPDATE behaviour is provably untouched.
+      expect(r.cmd, `${r.tablename}.cmd`).toBe('DELETE')
+      expect(r.roles, `${r.tablename}.roles`).toBe('{public}')
+      expect(r.qual, `${r.tablename}.qual`).toMatch(/current_setting\('app\.current_tenant_id'/)
+      expect(r.qual, `${r.tablename}.qual`).not.toMatch(/IS NULL/)
+    }
+  })
+
+  it('a tenant context cannot INSERT a RolePermission against the NULL-org system role', async () => {
+    // A permission the system role does not already hold, so a unique-constraint
+    // violation cannot be mistaken for the policy doing its job.
+    const extraPermission = await rawPrisma.permission.create({
+      data: { key: `rls.escalation.${stamp}`, description: 'fix-round-1 escalation probe' },
+    })
+    let thrown: Error | undefined
+    try {
+      await asTenant(A.orgId, (tx) =>
+        tx.$executeRawUnsafe(
+          `INSERT INTO "RolePermission" ("roleId","permissionId")
+           VALUES ('${systemRoleId}', '${extraPermission.id}')`
+        )
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+    console.log(
+      '[rls-security] system-role RolePermission INSERT error:',
+      thrown?.message.split('\n').slice(-2).join(' | ')
+    )
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/row-level security/i)
+
+    // Verified as the bypassing role: nothing landed.
+    const landed = await rawPrisma.rolePermission.findMany({
+      where: { roleId: systemRoleId, permissionId: extraPermission.id },
+    })
+    expect(landed).toEqual([])
+
+    await rawPrisma.permission.deleteMany({ where: { id: extraPermission.id } })
+  })
+
+  it("a tenant context cannot DELETE the system role's RolePermission rows", async () => {
+    // DELETE has no "new row", so WITH CHECK does not apply to it — Postgres
+    // governs DELETE by USING alone, and USING must stay permissive for reads.
+    // That is why migration 20260911185927_restrict_platform_role_deletes adds a
+    // RESTRICTIVE, FOR DELETE-only policy: restrictive policies are ANDed in, so
+    // they narrow DELETE without touching SELECT at all. Measured before that
+    // migration, this DELETE removed 1 row.
+    const affected = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(`DELETE FROM "RolePermission" WHERE "roleId" = '${systemRoleId}'`)
+    )
+    console.log('[rls-security] system-role RolePermission DELETE affected:', affected)
+    expect(affected).toBe(0)
+
+    // Verified as the bypassing role: the row is still there.
+    const stillThere = await rawPrisma.rolePermission.findMany({ where: { roleId: systemRoleId } })
+    expect(stillThere.length).toBeGreaterThan(0)
+  })
+
+  it('a tenant context cannot DELETE the NULL-org system Role itself', async () => {
+    // Worth its own test: Role.onDelete is Cascade, so deleting the platform
+    // role would take its RolePermission and Membership rows with it.
+    const affected = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(`DELETE FROM "Role" WHERE "id" = '${systemRoleId}'`)
+    )
+    console.log('[rls-security] system-Role DELETE affected:', affected)
+    expect(affected).toBe(0)
+
+    const stillThere = await rawPrisma.role.findUnique({ where: { id: systemRoleId } })
+    expect(stillThere).not.toBeNull()
+    expect(stillThere!.organizationId).toBeNull()
+  })
+
+  it("a tenant context cannot DELETE another tenant's Role", async () => {
+    const affected = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(`DELETE FROM "Role" WHERE "id" = '${B.roleId}'`)
+    )
+    expect(affected).toBe(0)
+    const stillThere = await rawPrisma.role.findUnique({ where: { id: B.roleId } })
+    expect(stillThere).not.toBeNull()
+  })
+
+  it('a tenant context cannot UPDATE the NULL-org system role (e.g. rename it)', async () => {
+    const before = await rawPrisma.role.findUniqueOrThrow({ where: { id: systemRoleId } })
+
+    let thrown: Error | undefined
+    let affected: number | undefined
+    try {
+      affected = await asTenant(A.orgId, (tx) =>
+        tx.$executeRawUnsafe(`UPDATE "Role" SET "name" = 'HACKED' WHERE "id" = '${systemRoleId}'`)
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+    console.log('[rls-security] system-role UPDATE:', { affected, error: thrown?.message.split('\n').pop() })
+    // The row IS visible (USING allows NULL-org), so the UPDATE matches it and
+    // then fails the strict WITH CHECK: an error, not a zero-row no-op.
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/row-level security/i)
+
+    const after = await rawPrisma.role.findUniqueOrThrow({ where: { id: systemRoleId } })
+    expect(after.name).toBe(before.name)
+    expect(after.name).not.toBe('HACKED')
+    expect(after.organizationId).toBeNull()
+  })
+
+  it('a tenant context cannot relocate its own Role to organizationId = NULL (self-promotion)', async () => {
+    let thrown: Error | undefined
+    try {
+      await asTenant(A.orgId, (tx) =>
+        tx.$executeRawUnsafe(`UPDATE "Role" SET "organizationId" = NULL WHERE "id" = '${A.roleId}'`)
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+    console.log(
+      '[rls-security] self-promotion to platform scope:',
+      thrown?.message.split('\n').slice(-2).join(' | ')
+    )
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/row-level security/i)
+
+    const unchanged = await rawPrisma.role.findUniqueOrThrow({ where: { id: A.roleId } })
+    expect(unchanged.organizationId).toBe(A.orgId)
+  })
+
+  it('a tenant context cannot relocate its own Role into another tenant either', async () => {
+    let thrown: Error | undefined
+    try {
+      await asTenant(A.orgId, (tx) =>
+        tx.$executeRawUnsafe(
+          `UPDATE "Role" SET "organizationId" = '${B.orgId}' WHERE "id" = '${A.roleId}'`
+        )
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/row-level security/i)
+    const unchanged = await rawPrisma.role.findUniqueOrThrow({ where: { id: A.roleId } })
+    expect(unchanged.organizationId).toBe(A.orgId)
+  })
+
+  it('a tenant context cannot INSERT a new platform-scoped Role of its own', async () => {
+    const rogueRoleId = fakeCuid()
+    let thrown: Error | undefined
+    try {
+      await asTenant(A.orgId, (tx) =>
+        tx.$executeRawUnsafe(
+          `INSERT INTO "Role" ("id","organizationId","name","isSystemRole")
+           VALUES ('${rogueRoleId}', NULL, 'ROGUE PLATFORM ${stamp}', true)`
+        )
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/row-level security/i)
+    const landed = await rawPrisma.role.findMany({ where: { id: rogueRoleId } })
+    expect(landed).toEqual([])
+  })
+
+  it('the writes a tenant SHOULD be able to do still work (not a blanket deny)', async () => {
+    // Control for every rejection above: the same statements, aimed at the
+    // tenant's own Role, must succeed.
+    const ownRoleId = fakeCuid()
+    const created = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(
+        `INSERT INTO "Role" ("id","organizationId","name","isSystemRole")
+         VALUES ('${ownRoleId}', '${A.orgId}', 'OWN ROLE ${stamp}', false)`
+      )
+    )
+    expect(created).toBe(1)
+
+    const renamed = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(`UPDATE "Role" SET "name" = 'OWN ROLE RENAMED ${stamp}' WHERE "id" = '${ownRoleId}'`)
+    )
+    expect(renamed).toBe(1)
+
+    const granted = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(
+        `INSERT INTO "RolePermission" ("roleId","permissionId")
+         VALUES ('${ownRoleId}', '${permissionId}')`
+      )
+    )
+    expect(granted).toBe(1)
+
+    const revoked = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(`DELETE FROM "RolePermission" WHERE "roleId" = '${ownRoleId}'`)
+    )
+    expect(revoked).toBe(1)
+
+    await rawPrisma.rolePermission.deleteMany({ where: { roleId: ownRoleId } })
+    await rawPrisma.role.deleteMany({ where: { id: ownRoleId } })
+  }, 60_000)
+
+  it('READ behaviour is unchanged: the NULL-org system role and its permissions stay visible', async () => {
+    // The half of the fix that must NOT have moved. If this regresses, RBAC
+    // reads an empty permission set for SUPER_ADMIN and fails closed.
+    const seen = await asTenant(A.orgId, async (tx) => {
+      const roles = await tx.$queryRawUnsafe<{ id: string; organizationId: string | null }[]>(
+        `SELECT "id","organizationId" FROM "Role"`
+      )
+      const perms = await tx.$queryRawUnsafe<{ roleId: string }[]>(
+        `SELECT "roleId" FROM "RolePermission"`
+      )
+      return { roleIds: roles.map((r) => r.id), permRoleIds: perms.map((p) => p.roleId) }
+    })
+    console.log('[rls-security] post-hardening read visibility:', {
+      roles: seen.roleIds.length,
+      perms: seen.permRoleIds.length,
+    })
+    expect(seen.roleIds).toContain(systemRoleId)
+    expect(seen.roleIds).toContain(A.roleId)
+    expect(seen.roleIds).not.toContain(B.roleId)
+    expect(seen.permRoleIds).toContain(systemRoleId)
+    expect(seen.permRoleIds).toContain(A.roleId)
+    expect(seen.permRoleIds).not.toContain(B.roleId)
+  })
 })
 
 // -----------------------------------------------------------------------------
@@ -1319,7 +1677,7 @@ describe('isolation survives the application layer (security items 16 and 17)', 
 
     // For contrast, the same unfiltered query as the bypassing runtime role sees
     // the whole table — which is exactly why the role-privilege finding matters.
-    const unrestricted = await withTenantContext(A.orgId, (tx) => tx.customer.count())
+    const unrestricted = await withTenantContext(A.orgId, (tx) => tx.customer.count(), TX_OPTIONS)
     console.log('[rls-security] same query as the runtime role sees:', unrestricted, 'rows')
     if (runtimeRole.rolbypassrls || runtimeRole.rolsuper) {
       expect(unrestricted).toBeGreaterThan(rows.length)
