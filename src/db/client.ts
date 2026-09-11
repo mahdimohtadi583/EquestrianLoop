@@ -97,12 +97,10 @@ import { rawPrisma } from './raw-client'
 // code. Nothing below claims otherwise.
 // ---------------------------------------------------------------------------
 
-// `permission` joins this allowlist in Task 3, once the Permission model actually exists in
-// schema.prisma (it's a fixed, global catalog — the ~13 permission-key rows seeded once — not
-// per-tenant data, and carries no organizationId column for RLS to key on). Referencing it here
-// before Task 3 adds the model is a TypeScript compile error against the generated Prisma Client
-// type, not just premature — keep this list in lockstep with which models actually exist.
-const PLATFORM_MODEL_KEYS = ['user', 'organization', 'subscription', 'auditLog'] as const
+// `permission` belongs on this allowlist because it is a fixed, global catalog — the ~13
+// permission-key rows seeded once — not per-tenant data, and carries no organizationId column for
+// RLS to key on. Keep this list in lockstep with which models actually exist in schema.prisma.
+const PLATFORM_MODEL_KEYS = ['user', 'organization', 'subscription', 'auditLog', 'permission'] as const
 
 // The only non-model members of the client that are exposed. `$transaction` is
 // deliberately absent: its callback hands back an unrestricted `tx` that the
@@ -179,8 +177,8 @@ export class TenantScopedModelAccessError extends Error {
     super(
       reason === undefined
         ? `Blocked access to prisma.${path} — the platform-scoped client exposes only the platform-level ` +
-            `models (user, organization, subscription, auditLog) and their standard query methods, plus ` +
-            `$connect/$disconnect. Tenant-scoped models, $transaction, raw SQL, and every Prisma internal ` +
+            `models (user, organization, subscription, auditLog, permission) and their standard query methods, ` +
+            `plus $connect/$disconnect. Tenant-scoped models, $transaction, raw SQL, and every Prisma internal ` +
             `are structurally absent from this object, not merely hidden. Tenant-scoped access must go ` +
             `through withTenantContext(organizationId, (tx) => ...) from '@/server/tenant/context' so the ` +
             `Postgres RLS session variable is set before the query runs.`
@@ -833,7 +831,7 @@ function buildPlatformScopedClient(): MinimalTarget {
 
 type PlatformScopedClient = Pick<
   typeof rawPrisma,
-  'user' | 'organization' | 'subscription' | 'auditLog' | '$connect' | '$disconnect'
+  'user' | 'organization' | 'subscription' | 'auditLog' | 'permission' | '$connect' | '$disconnect'
 >
 
 /**

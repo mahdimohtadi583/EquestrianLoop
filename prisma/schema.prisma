@@ -29,6 +29,8 @@ model User {
   phone        String?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
+
+  memberships Membership[]
 }
 
 model Organization {
@@ -43,6 +45,8 @@ model Organization {
 
   branches     Branch[]
   subscription Subscription?
+  memberships  Membership[]
+  roles        Role[]
 }
 
 model Branch {
@@ -54,6 +58,8 @@ model Branch {
   timezone       String
   operatingHours Json     @default("{}")
   createdAt      DateTime @default(now())
+
+  memberships Membership[]
 
   @@index([organizationId])
 }
@@ -83,4 +89,51 @@ model AuditLog {
   createdAt      DateTime @default(now())
 
   @@index([organizationId])
+}
+
+model Membership {
+  id             String    @id @default(cuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branchId       String?
+  branch         Branch?   @relation(fields: [branchId], references: [id])
+  roleId         String
+  role           Role      @relation(fields: [roleId], references: [id])
+  invitedAt      DateTime  @default(now())
+  acceptedAt     DateTime?
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+}
+
+model Role {
+  id             String   @id @default(cuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  isSystemRole   Boolean  @default(true)
+
+  permissions RolePermission[]
+  memberships Membership[]
+
+  @@index([organizationId])
+}
+
+model Permission {
+  id          String @id @default(cuid())
+  key         String @unique
+  description String
+
+  roles RolePermission[]
+}
+
+model RolePermission {
+  roleId       String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permissionId String
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
 }

@@ -11,7 +11,7 @@ import { prisma, TenantScopedModelAccessError } from '@/db/client'
 import { rawPrisma } from '@/db/raw-client'
 
 /** Keys the boundary is allowed to expose on `prisma`, and nothing else. */
-const ALLOWED_CLIENT_KEYS = ['user', 'organization', 'subscription', 'auditLog', '$connect', '$disconnect']
+const ALLOWED_CLIENT_KEYS = ['user', 'organization', 'subscription', 'auditLog', 'permission', '$connect', '$disconnect']
 
 /** Names that must never be observable through any operation on `prisma`. */
 const DANGEROUS_CLIENT_KEYS = [
@@ -60,11 +60,38 @@ describe('tenant-access boundary', () => {
     expect(() => (prisma as unknown as { $transaction: unknown }).$transaction).toThrow(TenantScopedModelAccessError)
   })
 
-  it('still allows the four platform-level models that exist as of this task (permission joins in Task 3)', () => {
+  it('still allows the five platform-level models', () => {
     expect(() => prisma.user).not.toThrow()
     expect(() => prisma.organization).not.toThrow()
     expect(() => prisma.subscription).not.toThrow()
     expect(() => prisma.auditLog).not.toThrow()
+    expect(() => prisma.permission).not.toThrow()
+  })
+
+  // Task 3 regression: `permission` newly joined PLATFORM_MODEL_KEYS alongside
+  // the other four models. `Permission.roles: RolePermission[]` is a real
+  // relation the RBAC schema adds, so this proves the existing generic
+  // guard/seal machinery (assertNoRelationTraversal, sealMinimalTarget)
+  // applies to it automatically — no Permission-specific logic was added.
+  describe('prisma.permission gets the same protections as the other platform models (Task 3)', () => {
+    it('prisma.permission.findMany() works against the live database', async () => {
+      const rows = await prisma.permission.findMany()
+      expect(Array.isArray(rows)).toBe(true)
+    })
+
+    it('prisma.permission.findMany({ include: { roles: true } }) throws — Permission.roles is a real relation', () => {
+      expect(() => (prisma.permission as Loose).findMany({ include: { roles: true } })).toThrow(
+        TenantScopedModelAccessError
+      )
+    })
+
+    it('prisma.permission has no $parent, matching the other four delegates', () => {
+      const delegate = prisma.permission as unknown as { $parent: unknown }
+      expect(() => delegate.$parent).toThrow(TenantScopedModelAccessError)
+      expect(Object.getOwnPropertyDescriptor(delegate, '$parent')).toBeUndefined()
+      expect('$parent' in delegate).toBe(false)
+      expect(Reflect.ownKeys(delegate as object).map(String)).not.toContain('$parent')
+    })
   })
 
   // Regression tests for a bypass found in review: the `get` trap used to
@@ -453,10 +480,13 @@ describe('tenant-access boundary', () => {
 
       // If a later task removes these relations, these tests must be
       // re-derived rather than silently passing against a schema that can no
-      // longer express the exploit.
-      expect(relationNamesOf('Organization').sort()).toEqual(['branches', 'subscription'])
+      // longer express the exploit. `memberships`/`roles` on Organization and
+      // `memberships` on User are Task 3 additions (RBAC schema); they don't
+      // affect the branches/subscription exploit paths this test protects,
+      // but the pinned list must still reflect the real datamodel.
+      expect(relationNamesOf('Organization').sort()).toEqual(['branches', 'memberships', 'roles', 'subscription'])
       expect(relationNamesOf('Subscription')).toEqual(['organization'])
-      expect(relationNamesOf('User')).toEqual([])
+      expect(relationNamesOf('User')).toEqual(['memberships'])
       expect(relationNamesOf('AuditLog')).toEqual([])
       // And `Branch` — the tenant-scoped target — is genuinely reachable from
       // Organization in the schema, which is what made the exploit possible.
