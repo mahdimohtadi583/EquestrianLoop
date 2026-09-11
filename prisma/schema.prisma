@@ -31,6 +31,8 @@ model User {
   updatedAt    DateTime @updatedAt
 
   memberships Membership[]
+  customer    Customer?
+  staff       Staff?
 }
 
 model Organization {
@@ -47,6 +49,9 @@ model Organization {
   subscription Subscription?
   memberships  Membership[]
   roles        Role[]
+  customers    Customer[]
+  staffMembers Staff[]
+  horses       Horse[]
 }
 
 model Branch {
@@ -59,7 +64,9 @@ model Branch {
   operatingHours Json     @default("{}")
   createdAt      DateTime @default(now())
 
-  memberships Membership[]
+  memberships  Membership[]
+  staffMembers Staff[]
+  horses       Horse[]
 
   @@index([organizationId])
 }
@@ -136,4 +143,64 @@ model RolePermission {
   permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
 
   @@id([roleId, permissionId])
+}
+
+model Customer {
+  id             String   @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String   @unique
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  qrToken        String   @unique @default(cuid())
+  firstName      String
+  lastName       String
+  phone          String?
+  notes          String?
+  createdAt      DateTime @default(now())
+
+  @@unique([organizationId, userId])
+  @@index([organizationId])
+}
+
+model Staff {
+  id             String   @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branchId       String?
+  branch         Branch?  @relation(fields: [branchId], references: [id])
+  userId         String   @unique
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title          String?
+  employmentStart DateTime @default(now())
+
+  trainer Trainer?
+
+  @@unique([organizationId, userId])
+  @@index([organizationId])
+}
+
+model Trainer {
+  id             String   @id @default(cuid())
+  staffId        String   @unique
+  staff          Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  bio            String?
+  specialties    String[]
+  certifications String[]
+}
+
+model Horse {
+  id             String   @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branchId       String
+  branch         Branch   @relation(fields: [branchId], references: [id])
+  name           String
+  breed          String?
+  dob            DateTime?
+  notes          String?
+  photoUrl       String?
+  status         String   @default("ACTIVE")
+  createdAt      DateTime @default(now())
+
+  @@index([organizationId])
 }

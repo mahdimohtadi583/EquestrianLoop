@@ -26,6 +26,10 @@ const DANGEROUS_CLIENT_KEYS = [
   '_requestHandler',
   '_extensions',
   'branch',
+  'customer',
+  'staff',
+  'trainer',
+  'horse',
   '$transaction',
   '$queryRaw',
   '$queryRawUnsafe',
@@ -481,12 +485,22 @@ describe('tenant-access boundary', () => {
       // If a later task removes these relations, these tests must be
       // re-derived rather than silently passing against a schema that can no
       // longer express the exploit. `memberships`/`roles` on Organization and
-      // `memberships` on User are Task 3 additions (RBAC schema); they don't
-      // affect the branches/subscription exploit paths this test protects,
-      // but the pinned list must still reflect the real datamodel.
-      expect(relationNamesOf('Organization').sort()).toEqual(['branches', 'memberships', 'roles', 'subscription'])
+      // `memberships` on User are Task 3 additions (RBAC schema); `customers`/
+      // `staffMembers`/`horses` on Organization and `customer`/`staff` on User
+      // are Task 4 additions (Customer/Staff/Trainer/Horse schema). None of
+      // these affect the branches/subscription exploit paths this test
+      // protects, but the pinned list must still reflect the real datamodel.
+      expect(relationNamesOf('Organization').sort()).toEqual([
+        'branches',
+        'customers',
+        'horses',
+        'memberships',
+        'roles',
+        'staffMembers',
+        'subscription',
+      ])
       expect(relationNamesOf('Subscription')).toEqual(['organization'])
-      expect(relationNamesOf('User')).toEqual(['memberships'])
+      expect(relationNamesOf('User')).toEqual(['memberships', 'customer', 'staff'])
       expect(relationNamesOf('AuditLog')).toEqual([])
       // And `Branch` — the tenant-scoped target — is genuinely reachable from
       // Organization in the schema, which is what made the exploit possible.
