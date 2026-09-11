@@ -68,6 +68,13 @@ enum CustomerMembershipStatus {
   EXPIRED
 }
 
+enum LoyaltyTransactionType {
+  EARN
+  REDEEM
+  ADJUSTMENT
+  EXPIRATION
+}
+
 model User {
   id           String   @id @default(cuid())
   email        String   @unique
@@ -107,6 +114,10 @@ model Organization {
   checkIns      CheckIn[]
   membershipPlans      MembershipPlan[]
   customerMemberships  CustomerMembership[]
+  loyaltyAccounts      LoyaltyAccount[]
+  loyaltyTransactions  LoyaltyTransaction[]
+  rewards              Reward[]
+  rewardRedemptions    RewardRedemption[]
 }
 
 model Branch {
@@ -217,6 +228,8 @@ model Customer {
 
   bookings Booking[]
   memberships CustomerMembership[]
+  loyaltyAccount LoyaltyAccount?
+  rewardRedemptions RewardRedemption[]
 
   @@unique([organizationId, userId])
   @@index([organizationId])
@@ -432,4 +445,67 @@ model CustomerMembership {
 
   @@index([organizationId])
   @@index([customerId])
+}
+
+model LoyaltyAccount {
+  id             String   @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerId     String   @unique
+  customer       Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  balance        Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  transactions LoyaltyTransaction[]
+
+  @@index([organizationId])
+}
+
+model LoyaltyTransaction {
+  id               String                  @id @default(cuid())
+  organizationId   String
+  organization     Organization            @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  loyaltyAccountId String
+  loyaltyAccount   LoyaltyAccount          @relation(fields: [loyaltyAccountId], references: [id], onDelete: Cascade)
+  type             LoyaltyTransactionType
+  points           Int
+  sourceType       String
+  sourceId         String?
+  createdAt        DateTime                @default(now())
+
+  redemption RewardRedemption?
+
+  @@index([organizationId])
+}
+
+model Reward {
+  id             String   @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  description    String?
+  pointsCost     Int
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  redemptions RewardRedemption[]
+
+  @@index([organizationId])
+}
+
+model RewardRedemption {
+  id                   String              @id @default(cuid())
+  organizationId       String
+  organization         Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerId           String
+  customer             Customer            @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  rewardId             String
+  reward               Reward              @relation(fields: [rewardId], references: [id])
+  loyaltyTransactionId String              @unique
+  loyaltyTransaction   LoyaltyTransaction  @relation(fields: [loyaltyTransactionId], references: [id])
+  status               String              @default("COMPLETED")
+  createdAt            DateTime            @default(now())
+
+  @@index([organizationId])
 }
