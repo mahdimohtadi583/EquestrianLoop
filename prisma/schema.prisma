@@ -56,6 +56,18 @@ enum BlockedTimeScope {
   HORSE
 }
 
+enum MembershipPeriod {
+  WEEKLY
+  MONTHLY
+  ANNUAL
+}
+
+enum CustomerMembershipStatus {
+  ACTIVE
+  CANCELED
+  EXPIRED
+}
+
 model User {
   id           String   @id @default(cuid())
   email        String   @unique
@@ -93,6 +105,8 @@ model Organization {
   ridingSessions RidingSession[]
   bookings      Booking[]
   checkIns      CheckIn[]
+  membershipPlans      MembershipPlan[]
+  customerMemberships  CustomerMembership[]
 }
 
 model Branch {
@@ -109,6 +123,7 @@ model Branch {
   staffMembers Staff[]
   horses       Horse[]
   ridingSessions RidingSession[]
+  membershipPlans MembershipPlanBranch[]
 
   @@index([organizationId])
 }
@@ -201,6 +216,7 @@ model Customer {
   createdAt      DateTime @default(now())
 
   bookings Booking[]
+  memberships CustomerMembership[]
 
   @@unique([organizationId, userId])
   @@index([organizationId])
@@ -279,6 +295,7 @@ model Service {
   createdAt      DateTime       @default(now())
 
   sessions RidingSession[]
+  membershipPlans MembershipPlanService[]
 
   @@index([organizationId])
 }
@@ -354,4 +371,65 @@ model CheckIn {
   checkedInByStaffId  String
 
   @@index([organizationId])
+}
+
+model MembershipPlan {
+  id             String   @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  description    String?
+  price          Decimal  @db.Decimal(10, 2)
+  durationValue  Int
+  durationUnit   MembershipPeriod
+  maxSessions    Int?
+  discountPercentage Decimal? @db.Decimal(5, 2)
+  loyaltyBonusMultiplier Decimal @default(1.0) @db.Decimal(4, 2)
+  allowsSelfBooking Boolean @default(true)
+  bookingPriorityWeight Int @default(0)
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  allowedServices MembershipPlanService[]
+  allowedBranches MembershipPlanBranch[]
+  customerMemberships CustomerMembership[]
+
+  @@index([organizationId])
+}
+
+model MembershipPlanService {
+  membershipPlanId String
+  membershipPlan   MembershipPlan @relation(fields: [membershipPlanId], references: [id], onDelete: Cascade)
+  serviceId        String
+  service          Service        @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@id([membershipPlanId, serviceId])
+}
+
+model MembershipPlanBranch {
+  membershipPlanId String
+  membershipPlan   MembershipPlan @relation(fields: [membershipPlanId], references: [id], onDelete: Cascade)
+  branchId         String
+  branch           Branch         @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@id([membershipPlanId, branchId])
+}
+
+model CustomerMembership {
+  id                String                    @id @default(cuid())
+  organizationId    String
+  organization      Organization              @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerId        String
+  customer          Customer                  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  membershipPlanId  String
+  membershipPlan    MembershipPlan            @relation(fields: [membershipPlanId], references: [id])
+  startDate         DateTime                  @default(now())
+  endDate           DateTime
+  status            CustomerMembershipStatus  @default(ACTIVE)
+  paymentId         String?
+  createdAt         DateTime                  @default(now())
+  updatedAt         DateTime                  @updatedAt
+
+  @@index([organizationId])
+  @@index([customerId])
 }

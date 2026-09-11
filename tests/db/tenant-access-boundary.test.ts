@@ -35,6 +35,10 @@ const DANGEROUS_CLIENT_KEYS = [
   'ridingSession',
   'booking',
   'checkIn',
+  'membershipPlan',
+  'membershipPlanService',
+  'membershipPlanBranch',
+  'customerMembership',
   '$transaction',
   '$queryRaw',
   '$queryRawUnsafe',
@@ -495,16 +499,19 @@ describe('tenant-access boundary', () => {
       // are Task 4 additions (Customer/Staff/Trainer/Horse schema);
       // `services`/`blockedTimes`/`ridingSessions`/`bookings`/`checkIns` on
       // Organization are Task 5 additions (Service Catalog & Scheduling
-      // schema). None of these affect the branches/subscription exploit paths
-      // this test protects, but the pinned list must still reflect the real
-      // datamodel.
+      // schema); `membershipPlans`/`customerMemberships` on Organization are
+      // Task 6 additions (MembershipPlan/CustomerMembership schema). None of
+      // these affect the branches/subscription exploit paths this test
+      // protects, but the pinned list must still reflect the real datamodel.
       expect(relationNamesOf('Organization').sort()).toEqual([
         'blockedTimes',
         'bookings',
         'branches',
         'checkIns',
+        'customerMemberships',
         'customers',
         'horses',
+        'membershipPlans',
         'memberships',
         'ridingSessions',
         'roles',
