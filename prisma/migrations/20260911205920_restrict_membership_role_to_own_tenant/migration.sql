@@ -1,0 +1,111 @@
+-- =============================================================================
+-- Task 9, Fix Round 3 (part 2): a "Membership" may only reference a "Role" that
+-- belongs to the very same organization.
+--
+-- THE HOLE THIS CLOSES
+-- --------------------
+-- "Membership"'s policy (20260911152445_enable_rls) tests one thing:
+-- `"organizationId" = current_setting('app.current_tenant_id', true)`. The row's
+-- OTHER security-relevant foreign key, `roleId`, was never checked. Since the
+-- policy carries no explicit WITH CHECK, that single predicate governed writes
+-- too — so any valid tenant context could hand one of its own users a
+-- "Membership" pointing at the NULL-org platform SUPER_ADMIN "Role", or at
+-- another tenant's "Role". Measured live on this deployment (PostgreSQL 17.6)
+-- under `SET LOCAL ROLE authenticated` with a valid tenant context, before this
+-- migration:
+--
+--     INSERT INTO "Membership" (... ,"organizationId","roleId")
+--     VALUES (..., '<own org>', '<NULL-org platform role>');      -> 1 row
+--     INSERT INTO "Membership" (... ,"organizationId","roleId")
+--     VALUES (..., '<own org>', '<other tenant''s role>');        -> 1 row
+--     UPDATE "Membership" SET "roleId" = '<NULL-org platform role>' ...; -> 1 row
+--     UPDATE "Membership" SET "roleId" = '<other tenant''s role>'  ...;  -> 1 row
+--
+-- Rounds 1 and 2 made the platform role itself untouchable from a tenant
+-- context. This path never touches it: it points AT it. No RBAC-resolution code
+-- exists yet (Task 13), so nothing reads these rows today — which makes this
+-- latent, not live. It stops being latent the moment any future code resolves
+-- Membership -> Role -> RolePermission to make an authorization decision, and it
+-- would then be silent, because every row involved looks perfectly well-formed.
+--
+-- THE SEMANTICS, REASONED OUT — NOT COPIED FROM ROUND 1
+-- ----------------------------------------------------
+-- Round 1 deliberately kept a NULL-org allowance on "RolePermission"'s READ
+-- predicate, because a "RolePermission" row carries no data of its own: its
+-- entire meaning is its parent "Role"'s permission set, and a platform system
+-- role's permission set must stay readable in every context or RBAC fails
+-- closed. That justification is specific to that table and does NOT transfer
+-- here:
+--
+--   * "Membership"."organizationId" is NOT NULL. A Membership is, by
+--     definition, one person's role assignment INSIDE one organization. There is
+--     no such thing as a platform-level Membership row to accommodate.
+--   * `Role."organizationId" IS NULL` means the opposite kind of thing: a
+--     platform-wide system role (SUPER_ADMIN), owned by the installation, not by
+--     any tenant. Attaching a tenant-scoped Membership to it is precisely the
+--     escalation — it would grant a tenant's user platform-wide authority.
+--   * Nothing in this codebase creates such a row. Every "Membership" written
+--     anywhere (tests/db/rbac-schema.test.ts is the only writer today;
+--     prisma/seed.ts writes none) uses a "Role" of the same organization.
+--     Platform administrators are modelled by `User.type = PLATFORM_ADMIN`, not
+--     by a Membership into a nonexistent platform organization.
+--
+-- So the correct rule is a STRICT match with no exception at all: the
+-- referenced Role's organizationId must equal the Membership's own
+-- organizationId. A NULL-org role can never satisfy it (NULL = x is NULL, which
+-- is not TRUE), and neither can another tenant's.
+--
+-- WHY THIS IS A WITH CHECK AND NOT A WIDENED USING
+-- ------------------------------------------------
+-- The USING clause is deliberately left EXACTLY as it was, and that is a
+-- reasoned choice rather than symmetry with rounds 1-2:
+--
+--   * Read side. A "Membership" row's tenant is stated directly by its own NOT
+--     NULL "organizationId" column. Whether its roleId happens to be sane is a
+--     referential-integrity question, not a visibility question — and folding it
+--     into USING would make any pre-existing malformed row silently INVISIBLE to
+--     the tenant that owns it, hiding the very rows an operator would need to
+--     see to clean up. Reads stay keyed on the row's own tenant.
+--   * Old-row side of UPDATE, and DELETE. These are governed by USING, and USING
+--     here admits ONLY rows of the caller's own organization — unlike
+--     "Role"/"RolePermission", whose USING deliberately admitted foreign
+--     (NULL-org) rows and therefore needed the RESTRICTIVE FOR UPDATE / FOR
+--     DELETE policies of rounds 1 and 2. "Membership" has no platform-scoped
+--     rows to protect and none can exist (the column is NOT NULL), so the
+--     old-row side is already strict and no restrictive policy is warranted.
+--   * New-row side of INSERT and UPDATE. This is the entire attack surface —
+--     creating, or re-pointing, a Membership at a role outside its tenant — and
+--     WITH CHECK is exactly the clause Postgres applies to the row an INSERT or
+--     UPDATE produces. Stating it explicitly also ends the implicit reuse of
+--     USING as WITH CHECK, which is what let the unchecked roleId through.
+--
+-- The tenant-match conjunct is kept in WITH CHECK alongside the new one, because
+-- naming WITH CHECK explicitly replaces the implicit copy of USING — dropping it
+-- would have re-opened cross-tenant INSERT of Membership rows.
+--
+-- The EXISTS subquery runs as the querying role and is therefore itself subject
+-- to "Role"'s policy. That can only narrow the result, never widen it: another
+-- tenant's Role is invisible (so EXISTS is false), and a NULL-org Role is
+-- visible but fails the equality test against the Membership's NOT NULL
+-- organizationId. Both halves of the rejection are independent.
+--
+-- Nothing legitimate is lost: a Membership whose role belongs to its own
+-- organization satisfies the predicate, which is every Membership the
+-- application has any way to create. prisma/seed.ts and the schema tests run as
+-- `rawPrisma` / `postgres` with no tenant context and bypass RLS entirely.
+--
+-- ALTER POLICY, not CREATE: the policy already exists. Produced with
+-- `prisma migrate dev --create-only` and then hand-written, the same two-step
+-- pattern every other RLS migration in this project uses.
+-- =============================================================================
+
+ALTER POLICY tenant_isolation ON "Membership"
+  USING ("organizationId" = current_setting('app.current_tenant_id', true))
+  WITH CHECK (
+    "organizationId" = current_setting('app.current_tenant_id', true)
+    AND EXISTS (
+      SELECT 1 FROM "Role"
+      WHERE "Role"."id" = "Membership"."roleId"
+        AND "Role"."organizationId" = "Membership"."organizationId"
+    )
+  );

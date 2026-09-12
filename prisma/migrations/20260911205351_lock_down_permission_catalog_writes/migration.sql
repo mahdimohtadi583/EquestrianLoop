@@ -1,0 +1,81 @@
+-- =============================================================================
+-- Task 9, Fix Round 3 (part 1): "Permission" — readable by everyone, writable by
+-- nobody who is subject to RLS.
+--
+-- THE HOLE THIS CLOSES
+-- --------------------
+-- 20260911152445_enable_rls covered the 19 tables carrying an `organizationId`
+-- plus the 4 columnless join/extension tables. "Permission" is in neither set:
+-- it is not tenant-scoped at all — it is a fixed, global catalog seeded once
+-- from src/config/permissions.ts (prisma/seed.ts::seedGlobalPermissions) and
+-- exposed as a platform model via `prisma.permission` (Task 3). It therefore
+-- had RLS neither enabled nor forced and carried zero policies, which in
+-- Postgres means "no restriction at all".
+--
+-- That is not harmless, because "RolePermission"."permissionId" references
+-- "Permission"("id") ON DELETE CASCADE. Rounds 1 and 2 spent four migrations
+-- making the platform SUPER_ADMIN role's grants unreachable from a tenant
+-- context through "Role" and "RolePermission" themselves — and the same outcome
+-- stayed reachable one table over. Measured live on this deployment
+-- (PostgreSQL 17.6) under `SET LOCAL ROLE authenticated` with a valid tenant
+-- context, before this migration:
+--
+--     DELETE FROM "Permission" WHERE "id" = '<permission>';
+--       -> 1 row, and the NULL-org platform role's matching "RolePermission"
+--          row went with it (cascade): sysRolePermsRemaining 1 -> 0.
+--     INSERT INTO "Permission" (...) VALUES (...);   -> 1 row
+--     UPDATE "Permission" SET "description" = 'HACKED' WHERE ...;  -> 1 row
+--
+-- So a tenant context could strip the platform role's permissions by deleting
+-- the catalog entries they resolve through, and could inject or rewrite catalog
+-- entries those grants are matched against.
+--
+-- THE FIX, AND WHY IT IS SHAPED THIS WAY
+-- --------------------------------------
+-- "Permission" must stay READABLE from every context — tenant, platform, and no
+-- context at all. The keys are a public, hard-coded catalog, every RBAC check
+-- resolves through them, and hiding them would make authorization fail closed
+-- for reasons that have nothing to do with tenancy (the same argument round 1
+-- made for keeping NULL-org "Role" rows visible).
+--
+-- It must never be WRITTEN from a role subject to RLS — not "only by the right
+-- tenant", because there is no right tenant: the catalog has no tenant. So the
+-- correct predicate is not a `current_setting('app.current_tenant_id')` test at
+-- all. It is: one permissive policy FOR SELECT USING (true), and deliberately
+-- NO policy covering INSERT, UPDATE or DELETE. With RLS enabled, a command for
+-- which zero policies exist is denied — reads return no rows, writes raise
+-- "new row violates row-level security policy" / affect nothing.
+--
+-- That default-deny behaviour was verified empirically on this exact server
+-- rather than taken from general Postgres knowledge; the measurements are in
+-- the Task 9 report (Fix Round 3) and are re-asserted every run by
+-- tests/db/rls-security.test.ts.
+--
+-- FORCE is applied for the same reason every other table in this project has
+-- it: it is a no-op when the runtime role is not the table owner and a real fix
+-- when it is an owner without BYPASSRLS.
+--
+-- WHY SEEDING IS UNAFFECTED
+-- -------------------------
+-- prisma/seed.ts writes "Permission" through `rawPrisma`, i.e. as Supabase's
+-- `postgres`, which has rolbypassrls = true (measured, see the Task 9 report).
+-- BYPASSRLS outranks both ENABLE and FORCE, so the seed's upserts are not
+-- governed by this policy — exactly as with every other policy in this project.
+-- Re-run against the live database after this migration and asserted in
+-- tests/db/rls-security.test.ts, rather than assumed.
+--
+-- The policy is named `permission_public_read`, not `tenant_isolation`: it is
+-- not a tenant predicate, and the coverage tests enumerate and count policies by
+-- that name.
+--
+-- Produced with `prisma migrate dev --create-only` and then hand-written — the
+-- same two-step pattern every other RLS migration in this project uses, since
+-- RLS policies are not modelled in schema.prisma.
+-- =============================================================================
+
+ALTER TABLE "Permission" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "Permission" FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY permission_public_read ON "Permission"
+  FOR SELECT
+  USING (true);

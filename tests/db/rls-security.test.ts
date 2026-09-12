@@ -6,6 +6,11 @@ import {
   assertValidOrganizationId,
   InvalidOrganizationIdError,
 } from '@/server/tenant/context'
+// Fix round 3: the seed's own write path into "Permission", exercised verbatim
+// rather than imitated, to prove the new deny-by-default policy does not touch
+// it (the seed runs as `rawPrisma`/`postgres`, which holds BYPASSRLS).
+import { seedGlobalPermissions } from '../../prisma/seed'
+import { PERMISSIONS } from '@/config/permissions'
 
 // =============================================================================
 // Task 9 — adversarial, live-Postgres proof that Row-Level Security is a real
@@ -2135,5 +2140,566 @@ describe('isolation survives the application layer (security items 16 and 17)', 
 
     const exists = await rawPrisma.customer.findUnique({ where: { id: B.customerId } })
     expect(exists).not.toBeNull()
+  })
+})
+
+// -----------------------------------------------------------------------------
+// Fix Round 3, finding 1 — "Permission" had no RLS at all, and
+// "RolePermission"."permissionId" is ON DELETE CASCADE.
+//
+// Rounds 1 and 2 made the NULL-org platform role's grants unreachable through
+// "Role" and "RolePermission" themselves. The same outcome stayed reachable one
+// table over: measured live under `SET LOCAL ROLE authenticated` with a valid
+// tenant context, before 20260911205351_lock_down_permission_catalog_writes,
+//
+//     DELETE FROM "Permission" WHERE "id" = '<permission>';   -> 1 row,
+//       and the platform role's matching RolePermission row cascaded away (1->0)
+//     INSERT INTO "Permission" ...                            -> 1 row
+//     UPDATE "Permission" SET "description" = 'HACKED' ...    -> 1 row
+//
+// The fix is shaped by what the table IS: a fixed, global, public catalog
+// (src/config/permissions.ts) with no tenant of its own. So it is not a tenant
+// predicate — it is ENABLE + FORCE plus exactly one permissive policy,
+// `permission_public_read` FOR SELECT USING (true), and deliberately no policy
+// covering INSERT/UPDATE/DELETE. Readable everywhere; writable by nobody subject
+// to RLS.
+//
+// The "no policy for a command means deny" behaviour is asserted here
+// empirically, per command, rather than taken on faith from the Postgres docs.
+// -----------------------------------------------------------------------------
+describe('Permission is a read-only public catalog under RLS (fix round 3)', () => {
+  it('has RLS enabled and forced, with exactly one SELECT-only permissive policy', async () => {
+    const state = await rawPrisma.$queryRawUnsafe<
+      { rls: boolean; force: boolean; policies: number }[]
+    >(
+      `SELECT c.relrowsecurity AS rls, c.relforcerowsecurity AS force,
+              (SELECT count(*)::int FROM pg_policies p
+                WHERE p.schemaname='public' AND p.tablename='Permission') AS policies
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname='public' AND c.relname='Permission'`
+    )
+    console.log('[rls-security] Permission RLS state:', state[0])
+    expect(state[0].rls).toBe(true)
+    expect(state[0].force).toBe(true)
+    expect(state[0].policies).toBe(1)
+
+    const policy = await rawPrisma.$queryRawUnsafe<
+      { policyname: string; cmd: string; permissive: string; roles: string; qual: string; with_check: string | null }[]
+    >(
+      `SELECT policyname, cmd, permissive, roles::text AS roles, qual, with_check
+         FROM pg_policies WHERE schemaname='public' AND tablename='Permission'`
+    )
+    console.log('[rls-security] Permission policy:', policy[0])
+    expect(policy[0].policyname).toBe('permission_public_read')
+    // SELECT-only is the whole mechanism: every write command is left with zero
+    // matching policies, which is what denies it.
+    expect(policy[0].cmd).toBe('SELECT')
+    expect(policy[0].permissive).toBe('PERMISSIVE')
+    expect(policy[0].roles).toBe('{public}')
+    expect(policy[0].qual).toBe('true')
+    expect(policy[0].with_check).toBeNull()
+  })
+
+  it('stays fully readable from a tenant context, a ghost context, and no context at all', async () => {
+    const asBypassingRole = await rawPrisma.permission.count()
+    expect(asBypassingRole).toBeGreaterThan(0)
+
+    const [fromTenant, fromNoContext, fromGhost] = await Promise.all([
+      asTenant(A.orgId, (tx) => count(tx, `SELECT count(*)::int AS count FROM "Permission"`)),
+      withNoTenantContext((tx) => count(tx, `SELECT count(*)::int AS count FROM "Permission"`)),
+      withRawTenantContext(fakeCuid(), (tx) =>
+        count(tx, `SELECT count(*)::int AS count FROM "Permission"`)
+      ),
+    ])
+    console.log('[rls-security] Permission readability:', {
+      asBypassingRole,
+      fromTenant,
+      fromNoContext,
+      fromGhost,
+    })
+    // Identical in every context — RLS must not have turned a public catalog
+    // into tenant data, or RBAC would fail closed for reasons unrelated to
+    // tenancy.
+    expect(fromTenant).toBe(asBypassingRole)
+    expect(fromNoContext).toBe(asBypassingRole)
+    expect(fromGhost).toBe(asBypassingRole)
+
+    // And the specific row this suite created is among them, reachable by id and
+    // through the Prisma delegate, not merely counted.
+    const byId = await asTenant(A.orgId, (tx) =>
+      tx.permission.findMany({ where: { id: permissionId } })
+    )
+    expect(byId.map((p) => p.id)).toEqual([permissionId])
+  })
+
+  it('rejects INSERT from a tenant context — and from any RLS-subject context', async () => {
+    for (const [label, run] of [
+      ['tenant context', (sql: string) => asTenant(A.orgId, (tx) => tx.$executeRawUnsafe(sql))],
+      ['no tenant context', (sql: string) => withNoTenantContext((tx) => tx.$executeRawUnsafe(sql))],
+    ] as const) {
+      const key = `rls.round3.insert.${label.replace(/\s/g, '-')}.${stamp}`
+      let thrown: Error | undefined
+      try {
+        await run(
+          `INSERT INTO "Permission" ("id","key","description")
+           VALUES ('${fakeCuid()}', '${key}', 'round-3 rogue catalog entry')`
+        )
+      } catch (error) {
+        thrown = error as Error
+      }
+      console.log(
+        `[rls-security] Permission INSERT (${label}):`,
+        thrown?.message.split('\n').slice(-1).join('')
+      )
+      expect(thrown, label).toBeDefined()
+      expect(thrown!.message, label).toMatch(/row-level security/i)
+
+      // Checked as the bypassing role: nothing landed.
+      const landed = await rawPrisma.permission.findMany({ where: { key } })
+      expect(landed, label).toEqual([])
+    }
+  }, 60_000)
+
+  it('rejects UPDATE from a tenant context (zero rows, catalog unchanged)', async () => {
+    const before = await rawPrisma.permission.findUniqueOrThrow({ where: { id: permissionId } })
+
+    const affected = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(
+        `UPDATE "Permission" SET "description" = 'HACKED' WHERE "id" = '${permissionId}'`
+      )
+    )
+    console.log('[rls-security] Permission UPDATE affected:', affected)
+    // Zero rows rather than an error: with no policy covering UPDATE, the old
+    // row is not eligible, so nothing is even scanned into the update.
+    expect(affected).toBe(0)
+
+    const after = await rawPrisma.permission.findUniqueOrThrow({ where: { id: permissionId } })
+    expect(after.description).toBe(before.description)
+    expect(after.description).not.toBe('HACKED')
+
+    // The `key` column is the one RBAC resolves through, so try that too.
+    const keyAffected = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(`UPDATE "Permission" SET "key" = 'billing.manage.rogue' WHERE "id" = '${permissionId}'`)
+    )
+    expect(keyAffected).toBe(0)
+    const keyAfter = await rawPrisma.permission.findUniqueOrThrow({ where: { id: permissionId } })
+    expect(keyAfter.key).toBe(before.key)
+  }, 60_000)
+
+  it("rejects DELETE, so the cascade into the platform role's grants is unreachable", async () => {
+    // The finding in its original form. RolePermission.permissionId is ON DELETE
+    // CASCADE, so before the fix this one statement stripped the NULL-org
+    // platform role of the grant resolving through this permission.
+    const grantsBefore = await rawPrisma.rolePermission.count({ where: { roleId: systemRoleId } })
+    expect(grantsBefore).toBeGreaterThan(0)
+
+    const affected = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(`DELETE FROM "Permission" WHERE "id" = '${permissionId}'`)
+    )
+    console.log('[rls-security] Permission DELETE affected:', affected)
+    expect(affected).toBe(0)
+
+    // Unkeyed phrasing too: "the attacker had to know the id" is not a defence.
+    const wholeTable = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(`DELETE FROM "Permission"`)
+    )
+    expect(wholeTable).toBe(0)
+
+    const noContext = await withNoTenantContext((tx) =>
+      tx.$executeRawUnsafe(`DELETE FROM "Permission" WHERE "id" = '${permissionId}'`)
+    )
+    expect(noContext).toBe(0)
+
+    // Verified as the bypassing role: the permission row and, crucially, the
+    // platform role's grants are all still there.
+    const stillThere = await rawPrisma.permission.findUnique({ where: { id: permissionId } })
+    expect(stillThere).not.toBeNull()
+    const grantsAfter = await rawPrisma.rolePermission.count({ where: { roleId: systemRoleId } })
+    expect(grantsAfter).toBe(grantsBefore)
+  }, 60_000)
+
+  it("the seed script's own write path is unaffected (it runs as a BYPASSRLS role)", async () => {
+    // Not an imitation of the seed — the seed's exported function itself,
+    // executed against the live database after the migration. It upserts every
+    // key in src/config/permissions.ts through rawPrisma.
+    await seedGlobalPermissions()
+
+    const seeded = await rawPrisma.permission.findMany({
+      where: { key: { in: [...PERMISSIONS] } },
+    })
+    console.log('[rls-security] seeded catalog keys present:', seeded.length, 'of', PERMISSIONS.length)
+    expect(seeded.length).toBe(PERMISSIONS.length)
+
+    // And the full write triad through the same role, to show the deny applies
+    // to RLS-subject roles only. Cleaned up immediately.
+    const probeKey = `rls.round3.seedpath.${stamp}`
+    const created = await rawPrisma.permission.create({
+      data: { key: probeKey, description: 'round-3 seed-path probe' },
+    })
+    const updated = await rawPrisma.permission.update({
+      where: { id: created.id },
+      data: { description: 'round-3 seed-path probe, updated' },
+    })
+    expect(updated.description).toMatch(/updated/)
+    await rawPrisma.permission.delete({ where: { id: created.id } })
+    expect(await rawPrisma.permission.findUnique({ where: { id: created.id } })).toBeNull()
+
+    // The measured reason this works, recorded rather than assumed.
+    console.log('[rls-security] seed-path role:', {
+      role: runtimeRole.current_user,
+      rolbypassrls: runtimeRole.rolbypassrls,
+      rolsuper: runtimeRole.rolsuper,
+    })
+    expect(runtimeRole.rolbypassrls || runtimeRole.rolsuper).toBe(true)
+  }, 120_000)
+
+  it("Postgres's zero-policy default really is deny on this server, per command", async () => {
+    // The claim the whole fix rests on, measured on this exact deployment rather
+    // than quoted from the manual: a table with RLS enabled and only a SELECT
+    // policy denies every other command. Proved on a throwaway table so the
+    // result cannot be an artefact of "Permission"'s grants or contents, then
+    // dropped.
+    const table = `rls_default_deny_${Date.now()}`
+    await rawPrisma.$executeRawUnsafe(`CREATE TABLE "${table}" (id text primary key, v text)`)
+    try {
+      await rawPrisma.$executeRawUnsafe(`INSERT INTO "${table}" VALUES ('seed','before')`)
+      await rawPrisma.$executeRawUnsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON "${table}" TO authenticated`)
+      await rawPrisma.$executeRawUnsafe(`ALTER TABLE "${table}" ENABLE ROW LEVEL SECURITY`)
+      await rawPrisma.$executeRawUnsafe(`ALTER TABLE "${table}" FORCE ROW LEVEL SECURITY`)
+      await rawPrisma.$executeRawUnsafe(
+        `CREATE POLICY read_all ON "${table}" FOR SELECT USING (true)`
+      )
+
+      const observed = await withNoTenantContext(async (tx) => {
+        const selected = await count(tx, `SELECT count(*)::int AS count FROM "${table}"`)
+        let insertError: string | null = null
+        try {
+          await tx.$executeRawUnsafe(`INSERT INTO "${table}" VALUES ('rogue','x')`)
+        } catch (error) {
+          insertError = (error as Error).message
+        }
+        return { selected, insertError }
+      })
+      // A failed INSERT aborts its transaction, so UPDATE/DELETE are measured in
+      // a second one.
+      const writes = await withNoTenantContext(async (tx) => ({
+        updated: await tx.$executeRawUnsafe(`UPDATE "${table}" SET v = 'after'`),
+        deleted: await tx.$executeRawUnsafe(`DELETE FROM "${table}"`),
+      }))
+
+      console.log('[rls-security] zero-policy default-deny measurement:', {
+        ...observed,
+        ...writes,
+      })
+      // SELECT: allowed by the one policy that exists.
+      expect(observed.selected).toBe(1)
+      // INSERT: no policy covers it -> hard error.
+      expect(observed.insertError).toMatch(/row-level security/i)
+      // UPDATE / DELETE: no policy covers them -> no row is eligible.
+      expect(writes.updated).toBe(0)
+      expect(writes.deleted).toBe(0)
+
+      const survived = await rawPrisma.$queryRawUnsafe<{ v: string; n: number }[]>(
+        `SELECT v, count(*)::int AS n FROM "${table}" GROUP BY v`
+      )
+      expect(survived).toEqual([{ v: 'before', n: 1 }])
+    } finally {
+      await rawPrisma.$executeRawUnsafe(`DROP TABLE IF EXISTS "${table}"`)
+    }
+  }, 120_000)
+})
+
+// -----------------------------------------------------------------------------
+// Fix Round 3, finding 2 — "Membership"."roleId" was never checked against the
+// Membership's own tenant.
+//
+// The policy tested "organizationId" alone and carried no explicit WITH CHECK,
+// so that one predicate governed writes too. Measured live under `SET LOCAL ROLE
+// authenticated` with a valid tenant context, before
+// 20260911205920_restrict_membership_role_to_own_tenant:
+//
+//   INSERT INTO "Membership" (...,'<own org>','<NULL-org platform role>') -> 1 row
+//   INSERT INTO "Membership" (...,'<own org>','<other tenant''s role>')   -> 1 row
+//   UPDATE "Membership" SET "roleId" = '<platform role>' ...              -> 1 row
+//   UPDATE "Membership" SET "roleId" = '<other tenant''s role>' ...       -> 1 row
+//
+// i.e. a tenant could grant one of its own users the platform SUPER_ADMIN role
+// without touching "Role" or "RolePermission" at all. Latent today (no RBAC
+// resolution code exists until Task 13), silent the moment it isn't.
+//
+// SEMANTICS — deliberately NOT round 1's NULL-org exception. Membership's
+// organizationId is NOT NULL and a Membership means "this person's role INSIDE
+// this organization", while Role.organizationId IS NULL means "platform-wide
+// system role". A Membership pointing at one is the escalation itself, and
+// nothing in this repo creates such a row. So: strict equality, no exception.
+//
+// ERRATUM to 20260911205920_restrict_membership_role_to_own_tenant's own comment:
+// it says platform administrators are modelled by `User.type = PLATFORM_ADMIN`.
+// That enum member does not exist. prisma/schema.prisma declares
+// `enum UserType { SUPER_ADMIN STAFF CUSTOMER }`, so the correct name is
+// SUPER_ADMIN. The correction is recorded here rather than in the migration
+// because that migration is already applied and Prisma stores a checksum of its
+// bytes in _prisma_migrations; editing even a comment makes `prisma migrate
+// dev`/`deploy` refuse to run until the checksum is re-recorded. Nothing
+// executable is affected — the SQL never referenced the enum.
+//
+// And the fix is a WITH CHECK only. Membership's USING already admits nothing
+// but the caller's own rows (unlike Role/RolePermission, whose USING had to stay
+// permissive), so DELETE and the old-row half of UPDATE are already strict and
+// need no RESTRICTIVE policy; the new-row half is the entire attack surface.
+// -----------------------------------------------------------------------------
+describe('Membership.roleId must belong to the same tenant (fix round 3)', () => {
+  /** Users with no Membership yet — @@unique([userId, organizationId]) bites otherwise. */
+  let freeUserAId: string
+  let freeUserA2Id: string
+  let membershipId: string
+
+  beforeAll(async () => {
+    const [u1, u2] = await Promise.all([
+      rawPrisma.user.create({
+        data: {
+          email: `rls-r3-a-${stamp}@test.com`,
+          passwordHash: 'x',
+          type: 'STAFF',
+          name: 'RLS round3 member',
+        },
+      }),
+      rawPrisma.user.create({
+        data: {
+          email: `rls-r3-b-${stamp}@test.com`,
+          passwordHash: 'x',
+          type: 'STAFF',
+          name: 'RLS round3 member 2',
+        },
+      }),
+    ])
+    freeUserAId = u1.id
+    freeUserA2Id = u2.id
+
+    // A legitimate, same-tenant Membership for tenant A, created as the
+    // bypassing role — the UPDATE tests need an existing row to aim at.
+    const membership = await rawPrisma.membership.create({
+      data: { userId: freeUserA2Id, organizationId: A.orgId, roleId: A.roleId },
+    })
+    membershipId = membership.id
+  }, 120_000)
+
+  afterAll(async () => {
+    try {
+      await rawPrisma.membership.deleteMany({
+        where: { userId: { in: [freeUserAId, freeUserA2Id] } },
+      })
+      await rawPrisma.user.deleteMany({ where: { id: { in: [freeUserAId, freeUserA2Id] } } })
+    } catch (error) {
+      console.warn('[rls-security] round-3 membership teardown skipped:', (error as Error).message)
+    }
+  }, 120_000)
+
+  it('the policy now carries an explicit WITH CHECK that joins Membership to Role', async () => {
+    const rows = await rawPrisma.$queryRawUnsafe<
+      { qual: string; with_check: string | null }[]
+    >(
+      `SELECT qual, with_check FROM pg_policies
+        WHERE schemaname='public' AND tablename='Membership' AND policyname='tenant_isolation'`
+    )
+    console.log('[rls-security] Membership policy:', rows[0])
+    expect(rows.length).toBe(1)
+
+    // READ side: unchanged, still the row's own organizationId and nothing else.
+    expect(rows[0].qual).toMatch(/current_setting\('app\.current_tenant_id'/)
+    expect(rows[0].qual).not.toMatch(/FROM "Role"/)
+
+    // WRITE side: tenant match AND a strict Role tenant match, with no NULL-org
+    // allowance anywhere in it.
+    expect(rows[0].with_check).not.toBeNull()
+    expect(rows[0].with_check).toMatch(/current_setting\('app\.current_tenant_id'/)
+    expect(rows[0].with_check).toMatch(/EXISTS[\s\S]*FROM "Role"[\s\S]*"roleId"/)
+    expect(rows[0].with_check).toMatch(/"Role"\."organizationId" = "Membership"\."organizationId"/)
+    expect(rows[0].with_check).not.toMatch(/IS NULL/)
+
+    // Membership is still counted as a single-policy table — no RESTRICTIVE
+    // policy was added, because USING is already strict here (see the block
+    // comment above).
+    const policies = await rawPrisma.$queryRawUnsafe<{ n: number }[]>(
+      `SELECT count(*)::int AS n FROM pg_policies WHERE schemaname='public' AND tablename='Membership'`
+    )
+    expect(policies[0].n).toBe(1)
+  })
+
+  it('a tenant cannot INSERT a Membership pointing at the NULL-org platform role', async () => {
+    // The escalation in its purest form: tenant A hands one of its own users the
+    // platform SUPER_ADMIN role, without ever touching Role or RolePermission.
+    let thrown: Error | undefined
+    const rogueId = fakeCuid()
+    try {
+      await asTenant(A.orgId, (tx) =>
+        tx.$executeRawUnsafe(
+          `INSERT INTO "Membership" ("id","userId","organizationId","roleId")
+           VALUES ('${rogueId}', '${freeUserAId}', '${A.orgId}', '${systemRoleId}')`
+        )
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+    console.log(
+      '[rls-security] Membership -> platform role INSERT:',
+      thrown?.message.split('\n').slice(-1).join('')
+    )
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/row-level security/i)
+
+    const landed = await rawPrisma.membership.findMany({ where: { id: rogueId } })
+    expect(landed).toEqual([])
+  })
+
+  it("a tenant cannot INSERT a Membership pointing at another tenant's role", async () => {
+    let thrown: Error | undefined
+    const rogueId = fakeCuid()
+    try {
+      await asTenant(A.orgId, (tx) =>
+        tx.$executeRawUnsafe(
+          `INSERT INTO "Membership" ("id","userId","organizationId","roleId")
+           VALUES ('${rogueId}', '${freeUserAId}', '${A.orgId}', '${B.roleId}')`
+        )
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+    console.log(
+      '[rls-security] Membership -> foreign-tenant role INSERT:',
+      thrown?.message.split('\n').slice(-1).join('')
+    )
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/row-level security/i)
+
+    const landed = await rawPrisma.membership.findMany({ where: { id: rogueId } })
+    expect(landed).toEqual([])
+  })
+
+  it('a tenant cannot UPDATE an existing Membership onto the platform role', async () => {
+    // The verb the INSERT tests miss: the row is legitimately the tenant's own,
+    // so USING admits it — and WITH CHECK rejects the row it would produce.
+    let thrown: Error | undefined
+    try {
+      await asTenant(A.orgId, (tx) =>
+        tx.$executeRawUnsafe(
+          `UPDATE "Membership" SET "roleId" = '${systemRoleId}' WHERE "id" = '${membershipId}'`
+        )
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+    console.log(
+      '[rls-security] Membership roleId re-point to platform role:',
+      thrown?.message.split('\n').slice(-1).join('')
+    )
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/row-level security/i)
+
+    const unchanged = await rawPrisma.membership.findUniqueOrThrow({ where: { id: membershipId } })
+    expect(unchanged.roleId).toBe(A.roleId)
+  })
+
+  it("a tenant cannot UPDATE an existing Membership onto another tenant's role", async () => {
+    let thrown: Error | undefined
+    try {
+      await asTenant(A.orgId, (tx) =>
+        tx.$executeRawUnsafe(
+          `UPDATE "Membership" SET "roleId" = '${B.roleId}' WHERE "id" = '${membershipId}'`
+        )
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/row-level security/i)
+
+    const unchanged = await rawPrisma.membership.findUniqueOrThrow({ where: { id: membershipId } })
+    expect(unchanged.roleId).toBe(A.roleId)
+  })
+
+  it('cross-tenant Membership writes are still rejected (the original predicate survived)', async () => {
+    // Naming WITH CHECK explicitly ends Postgres's implicit reuse of USING, so
+    // the tenant-match conjunct had to be restated. This proves it was.
+    let thrown: Error | undefined
+    try {
+      await asTenant(A.orgId, (tx) =>
+        tx.$executeRawUnsafe(
+          `INSERT INTO "Membership" ("id","userId","organizationId","roleId")
+           VALUES ('${fakeCuid()}', '${freeUserAId}', '${B.orgId}', '${B.roleId}')`
+        )
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+    expect(thrown).toBeDefined()
+    expect(thrown!.message).toMatch(/row-level security/i)
+  })
+
+  it('a legitimate same-tenant Membership can still be created, read, updated and deleted', async () => {
+    // The control that keeps every rejection above from being a blanket deny —
+    // and the specific thing a strict predicate could plausibly have broken.
+    const okId = fakeCuid()
+    const created = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(
+        `INSERT INTO "Membership" ("id","userId","organizationId","roleId")
+         VALUES ('${okId}', '${freeUserAId}', '${A.orgId}', '${A.roleId}')`
+      )
+    )
+    expect(created).toBe(1)
+
+    // Readable by its own tenant, through the Prisma delegate with no filter.
+    const visible = await asTenant(A.orgId, (tx) => tx.membership.findMany())
+    expect(visible.map((m) => m.id)).toContain(okId)
+    expect(visible.every((m) => m.organizationId === A.orgId)).toBe(true)
+
+    // Invisible to the other tenant.
+    const fromB = await asTenant(B.orgId, (tx) => tx.membership.findMany())
+    expect(fromB.map((m) => m.id)).not.toContain(okId)
+
+    // A non-role UPDATE still works (WITH CHECK re-evaluates the whole row, so a
+    // wrong predicate would have broken even this).
+    const accepted = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(`UPDATE "Membership" SET "acceptedAt" = now() WHERE "id" = '${okId}'`)
+    )
+    expect(accepted).toBe(1)
+
+    // And a roleId UPDATE onto another role of the SAME tenant is still allowed.
+    const siblingRoleId = fakeCuid()
+    await rawPrisma.role.create({
+      data: { id: siblingRoleId, organizationId: A.orgId, name: `ROUND3 SIBLING ${stamp}`, isSystemRole: false },
+    })
+    const rerouted = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(
+        `UPDATE "Membership" SET "roleId" = '${siblingRoleId}' WHERE "id" = '${okId}'`
+      )
+    )
+    expect(rerouted).toBe(1)
+    const after = await rawPrisma.membership.findUniqueOrThrow({ where: { id: okId } })
+    expect(after.roleId).toBe(siblingRoleId)
+
+    // DELETE of its own row is untouched (governed by USING, which did not move).
+    const deleted = await asTenant(A.orgId, (tx) =>
+      tx.$executeRawUnsafe(`DELETE FROM "Membership" WHERE "id" = '${okId}'`)
+    )
+    expect(deleted).toBe(1)
+    expect(await rawPrisma.membership.findUnique({ where: { id: okId } })).toBeNull()
+
+    await rawPrisma.role.deleteMany({ where: { id: siblingRoleId } })
+  }, 120_000)
+
+  it('the Prisma delegate path is blocked too, not just raw SQL', async () => {
+    await expect(
+      asTenant(A.orgId, (tx) =>
+        tx.membership.create({
+          data: { userId: freeUserAId, organizationId: A.orgId, roleId: systemRoleId },
+        })
+      )
+    ).rejects.toThrow(/row-level security/i)
+
+    const landed = await rawPrisma.membership.findMany({
+      where: { userId: freeUserAId, roleId: systemRoleId },
+    })
+    expect(landed).toEqual([])
   })
 })
