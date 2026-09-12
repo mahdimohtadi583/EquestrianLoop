@@ -1,4 +1,8 @@
-import 'dotenv/config'
+// One shared env-loading point (see src/db/env.ts). DIRECT_URL — the owner
+// connection this file hands to Prisma for migrations — is deliberately NOT
+// overridden by .env.test: migrations always run as `postgres`, in every
+// environment.
+import './src/db/env'
 
 export default {
   datasource: {

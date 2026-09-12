@@ -10,6 +10,10 @@
 // adapter (see src/db/raw-client.ts) — a client built without that adapter
 // has no connection string to use. Importing the already-configured
 // `rawPrisma` singleton avoids duplicating that wiring here.
+// MUST stay above the raw-client import: it re-points DATABASE_URL at the
+// owner connection for real seed runs, and raw-client resolves its connection
+// string at load time. No-op under NODE_ENV=test. See prisma/seed-connection.ts.
+import './seed-connection'
 import { rawPrisma as prisma } from '../src/db/raw-client'
 import { PERMISSIONS, DEFAULT_ROLE_PERMISSIONS } from '../src/config/permissions'
 

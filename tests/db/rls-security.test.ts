@@ -27,28 +27,61 @@ import { PERMISSIONS } from '@/config/permissions'
 // close (a): BYPASSRLS outranks FORCE, and that is a hard Postgres invariant,
 // not a setting.
 //
-// The role behind this project's DATABASE_URL is Supabase's `postgres`, and it
-// is in class (a): rolsuper = false but rolbypassrls = TRUE, and it also owns
-// every table in `public`. Measured, not assumed — the "runtime role privileges"
-// describe block below prints the verbatim pg_roles / pg_tables values and
-// asserts that the observed leak behaviour matches them.
+// The role THIS SUITE connects as is Supabase's `postgres`, and it is in class
+// (a): rolsuper = false but rolbypassrls = TRUE, and it also owns every table in
+// `public`. Measured, not assumed — the "runtime role privileges" describe block
+// below prints the verbatim pg_roles / pg_tables values and asserts that the
+// observed leak behaviour matches them.
+//
+// Note "this suite", not "the application": the security hardening round that
+// followed Task 9 moved the application's own DATABASE_URL onto `app_runtime`
+// (see below). `.env.test` deliberately overrides DATABASE_URL back to
+// `postgres` for test runs, because Tasks 3-8's sanctioned schema-verification
+// tests and prisma/seed.ts issue contextless reads and writes that RLS would
+// otherwise — correctly — refuse. So the owner/BYPASSRLS facts above still
+// describe this file's own connection, and the fixture-setup discipline below
+// still relies on them.
 //
 // Consequently, a test that simply called withTenantContext() and looked for
 // filtering would pass or fail for reasons that have nothing to do with the
 // policies. So every policy-behaviour test here issues its queries under
-// `SET LOCAL ROLE authenticated`.
+// `SET LOCAL ROLE app_runtime`.
 //
-// `authenticated` is a stock Supabase role that:
+// `app_runtime` is the purpose-built application role created by the hardening
+// round. It:
 //   - is NOT the owner of these tables (owner is `postgres`),
 //   - does NOT have rolsuper or rolbypassrls,
-//   - DOES hold SELECT/INSERT/UPDATE/DELETE on every table in `public`
-//     (Supabase's default privileges grant them).
+//   - DOES hold exactly SELECT/INSERT/UPDATE/DELETE on every table in `public`
+//     (and deliberately no TRUNCATE, REFERENCES or TRIGGER),
+//   - is the role the real application authenticates as via DATABASE_URL.
 // It is therefore fully subject to the policies, which makes it the correct
-// instrument for testing them. `SET LOCAL ROLE` is transaction-scoped and
+// instrument for testing them — and, unlike the role used before, it is not a
+// stand-in but the genuine article. `SET LOCAL ROLE` is transaction-scoped and
 // reverts at COMMIT and ROLLBACK, so it cannot leak into the connection pool.
 //
-// No Postgres role is created and no credential is changed by these tests;
-// `postgres` is already a member of `authenticated`, so SET ROLE is permitted.
+// WHAT CHANGED, AND WHY. This constant previously read
+// `SET LOCAL ROLE authenticated`. `authenticated` is one of the two roles
+// Supabase's PostgREST Data API maps incoming `apikey` requests onto, and it
+// happened to be non-owner, non-BYPASSRLS and fully DML-privileged on `public`,
+// which made it a convenient instrument. Part B of the hardening round revoked
+// all of its privileges (and `anon`'s) on `public`, because this project
+// authenticates with Auth.js + Prisma and never calls PostgREST, so those grants
+// were nothing but an unauthenticated read path to `User`.`passwordHash` on a
+// table with no RLS. With the grants gone, `authenticated` now raises
+// "permission denied" instead of returning an RLS-filtered result — which would
+// make these tests assert the wrong thing entirely. Hence the switch.
+//
+// No Postgres role is created and no credential is changed by these tests. The
+// migration 20260912093000_scope_runtime_role_and_revoke_data_api_grants issues
+// `GRANT app_runtime TO postgres` so that SET ROLE is permitted; that grants
+// `postgres` nothing it lacked (it owns the tables and holds BYPASSRLS, strictly
+// more privilege than `app_runtime`), and `app_runtime` itself is a member of
+// nothing.
+//
+// SCOPE OF THIS TECHNIQUE. `SET LOCAL ROLE` is still a role *switch* on an
+// owner connection. tests/db/runtime-role-rls.test.ts complements this file by
+// opening a connection with the real runtime DATABASE_URL and proving the same
+// isolation with no role-switching of any kind.
 //
 // TEST-DATA DISCIPLINE: all fixture rows — including, deliberately, the "victim"
 // tenant's rows — are created through `rawPrisma` directly, as `postgres`, with
@@ -79,8 +112,16 @@ vi.setConfig({ testTimeout: 120_000, hookTimeout: 240_000 })
  */
 const TX_OPTIONS = { maxWait: 30_000, timeout: 60_000 } as const
 
+/**
+ * The role the policies actually bind — and the role the application itself
+ * connects as. See the header note for why it is no longer `authenticated`.
+ * Referenced by name in the assertions and grants below, so there is exactly
+ * one place to change if it is ever renamed.
+ */
+const RLS_SUBJECT_ROLE = 'app_runtime'
+
 /** Downgrade to a role the policies actually bind. See the header note. */
-const ENFORCE_RLS = 'SET LOCAL ROLE authenticated'
+const ENFORCE_RLS = `SET LOCAL ROLE ${RLS_SUBJECT_ROLE}`
 
 /** The real `withTenantContext`, run under a role RLS applies to. */
 function asTenant<T>(
@@ -374,10 +415,14 @@ describe('runtime role privileges (security item 18)', () => {
           ? '  VERDICT: this role BYPASSES RLS. FORCE ROW LEVEL SECURITY cannot help —\n' +
             '           BYPASSRLS/SUPERUSER outranks FORCE in Postgres. The policies are\n' +
             '           correct and enforce fully for any role subject to them (proved by\n' +
-            '           the rest of this suite under SET LOCAL ROLE authenticated), but they\n' +
-            '           filter NOTHING for this connection. Closing it requires pointing\n' +
-            '           DATABASE_URL at a role without BYPASSRLS — an infrastructure and\n' +
-            '           credentials change, out of scope for Task 9.'
+            `           the rest of this suite under SET LOCAL ROLE ${RLS_SUBJECT_ROLE}), but\n` +
+            '           they filter NOTHING for this connection. That is expected here and\n' +
+            '           only here: .env.test deliberately points the TEST connection at the\n' +
+            '           owner role so Tasks 3-8\'s contextless schema tests keep working.\n' +
+            '           The APPLICATION no longer uses it — DATABASE_URL in .env names\n' +
+            `           ${RLS_SUBJECT_ROLE} (NOSUPERUSER, NOBYPASSRLS, non-owner), proved\n` +
+            '           end-to-end over a real runtime connection in\n' +
+            '           tests/db/runtime-role-rls.test.ts.'
           : '  VERDICT: this role is subject to RLS; the policies filter its queries.',
         '===================================================================',
         '',
@@ -442,7 +487,7 @@ describe('runtime role privileges (security item 18)', () => {
       return rows[0]
     })
     console.log('[rls-security] policy-test role:', observed)
-    expect(observed.current_user).toBe('authenticated')
+    expect(observed.current_user).toBe(RLS_SUBJECT_ROLE)
     expect(observed.rolsuper).toBe(false)
     expect(observed.rolbypassrls).toBe(false)
     expect(observed.owner).not.toBe(observed.current_user)
@@ -1695,7 +1740,10 @@ describe('Role/RolePermission writes cannot reach the platform system role (fix 
 // row was the NULL-org platform role and whose new row was owned by the caller
 // satisfied every round-1 predicate — both ends individually legal, the
 // combination an escalation. Measured live after both round-1 migrations, under
-// `SET LOCAL ROLE authenticated`:
+// `SET LOCAL ROLE authenticated` (the RLS-subject role this suite used at the
+// time; it is `app_runtime` now — see the header note. The finding stands either
+// way: both roles are non-owner and non-BYPASSRLS, so the policies bound them
+// identically):
 //
 //   UPDATE "Role" SET "organizationId" = '<own org>' WHERE "organizationId" IS NULL;  -> 1 row
 //   UPDATE "RolePermission" SET "roleId" = '<own role>' WHERE "roleId" = '<platform>'; -> 1 row
@@ -2149,7 +2197,8 @@ describe('isolation survives the application layer (security items 16 and 17)', 
 //
 // Rounds 1 and 2 made the NULL-org platform role's grants unreachable through
 // "Role" and "RolePermission" themselves. The same outcome stayed reachable one
-// table over: measured live under `SET LOCAL ROLE authenticated` with a valid
+// table over: measured live under `SET LOCAL ROLE authenticated` (this suite's
+// RLS-subject role at the time; `app_runtime` now — see the header note) with a valid
 // tenant context, before 20260911205351_lock_down_permission_catalog_writes,
 //
 //     DELETE FROM "Permission" WHERE "id" = '<permission>';   -> 1 row,
@@ -2363,7 +2412,9 @@ describe('Permission is a read-only public catalog under RLS (fix round 3)', () 
     await rawPrisma.$executeRawUnsafe(`CREATE TABLE "${table}" (id text primary key, v text)`)
     try {
       await rawPrisma.$executeRawUnsafe(`INSERT INTO "${table}" VALUES ('seed','before')`)
-      await rawPrisma.$executeRawUnsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON "${table}" TO authenticated`)
+      await rawPrisma.$executeRawUnsafe(
+        `GRANT SELECT, INSERT, UPDATE, DELETE ON "${table}" TO ${RLS_SUBJECT_ROLE}`
+      )
       await rawPrisma.$executeRawUnsafe(`ALTER TABLE "${table}" ENABLE ROW LEVEL SECURITY`)
       await rawPrisma.$executeRawUnsafe(`ALTER TABLE "${table}" FORCE ROW LEVEL SECURITY`)
       await rawPrisma.$executeRawUnsafe(
@@ -2415,7 +2466,8 @@ describe('Permission is a read-only public catalog under RLS (fix round 3)', () 
 //
 // The policy tested "organizationId" alone and carried no explicit WITH CHECK,
 // so that one predicate governed writes too. Measured live under `SET LOCAL ROLE
-// authenticated` with a valid tenant context, before
+// authenticated` (this suite's RLS-subject role at the time; `app_runtime` now —
+// see the header note) with a valid tenant context, before
 // 20260911205920_restrict_membership_role_to_own_tenant:
 //
 //   INSERT INTO "Membership" (...,'<own org>','<NULL-org platform role>') -> 1 row

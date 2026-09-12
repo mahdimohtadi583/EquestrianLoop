@@ -6,7 +6,12 @@
 // RLS-enforced). Schema-verification tests and prisma/seed.ts are the only
 // other sanctioned importers, since they sit outside the request-handling
 // application layer this split protects.
-import 'dotenv/config'
+// Loads .env, then overlays .env.test when NODE_ENV=test. Replaces the bare
+// `import 'dotenv/config'` that used to sit here: DATABASE_URL now names the
+// restricted, NOBYPASSRLS `app_runtime` role, and the test overlay is what
+// keeps Tasks 3-8's sanctioned contextless-rawPrisma pattern working. See
+// src/db/env.ts for the full reasoning and the dotenv-precedence evidence.
+import './env'
 import { PrismaClient } from '@prisma/client'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { Pool } from 'pg'
@@ -14,7 +19,10 @@ import { Pool } from 'pg'
 const globalForPrisma = globalThis as unknown as { rawPrisma?: PrismaClient }
 
 // DATABASE_URL is the pooled (transaction-mode) connection intended for
-// request-serving application traffic; DIRECT_URL is the unpooled,
+// request-serving application traffic, and as of the Task 9 Part A hardening
+// it authenticates as `app_runtime` — NOSUPERUSER, **NOBYPASSRLS**, not the
+// table owner — so every query issued through this client is genuinely
+// subject to the tenant_isolation RLS policies. DIRECT_URL is the unpooled,
 // session-mode connection meant only for `prisma migrate`/introspection
 // (see prisma.config.ts, which uses DIRECT_URL for exactly that). Preferring
 // DIRECT_URL here would route every runtime query through the low-limit

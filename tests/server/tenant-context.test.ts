@@ -14,8 +14,8 @@ import { withTenantContext } from '@/server/tenant/context'
 //     expect(visibleToA.every((c) => c.organizationId === orgA.id)).toBe(true)
 //
 // That assertion cannot hold on this database as written, and the reason is
-// exactly the caveat the brief itself raises at the end: the role behind
-// DATABASE_URL is Supabase's `postgres`, which is both the owner of every table
+// exactly the caveat the brief itself raises at the end: the role this suite
+// connects as is Supabase's `postgres`, which is both the owner of every table
 // in `public` AND holds rolbypassrls = true (measured — see the task report).
 // A BYPASSRLS role is exempt from every RLS policy, and FORCE ROW LEVEL
 // SECURITY cannot override that; it is a hard Postgres invariant. So an
@@ -26,19 +26,36 @@ import { withTenantContext } from '@/server/tenant/context'
 //
 // Rather than weaken the assertion (e.g. adding a `where` clause, which would
 // prove only that Prisma can filter, not that Postgres isolates), the read is
-// issued under `SET LOCAL ROLE authenticated`. `authenticated` is a stock
-// Supabase role that is NOT the table owner and does NOT hold BYPASSRLS, while
-// holding full DML privileges on `public` — so the policies actually apply, and
-// the brief's assertion then tests precisely what it was written to test.
+// issued under `SET LOCAL ROLE app_runtime` — the role RLS actually applies to.
 // `SET LOCAL ROLE` is transaction-scoped and reverts at COMMIT/ROLLBACK, so it
 // leaks nothing to the connection pool.
 //
+// WHY `app_runtime` AND NOT `authenticated` (security hardening, Parts A and B).
+//
+// This constant used to read `SET LOCAL ROLE authenticated`, a stock Supabase
+// role that happened to be non-owner, non-BYPASSRLS and fully DML-privileged on
+// `public` — a convenient stand-in. Two changes retired it:
+//
+//   Part A provisioned `app_runtime`, a real, purpose-built application role
+//   (NOSUPERUSER, NOBYPASSRLS, non-owner, ordinary CRUD only), and pointed
+//   DATABASE_URL at it. So the honest instrument is no longer a stand-in at
+//   all: it is the role the application genuinely connects as.
+//
+//   Part B revoked every privilege `anon` and `authenticated` held on `public`,
+//   because those are Supabase's PostgREST Data API roles and this project uses
+//   Auth.js with Prisma instead — they were an unauthenticated read path to
+//   `User`.`passwordHash`. `authenticated` therefore now gets "permission denied"
+//   rather than an RLS-filtered result, which would make these tests assert the
+//   wrong thing.
+//
 // tests/db/rls-security.test.ts carries the full adversarial suite built on the
-// same technique, including the evidence for the role-privilege claim above.
+// same technique, and tests/db/runtime-role-rls.test.ts proves the property
+// end-to-end over a connection opened with the real runtime DATABASE_URL, with
+// no SET ROLE at all.
 // ---------------------------------------------------------------------------
 
 /** See the note above: downgrades the transaction to a role RLS actually applies to. */
-const ENFORCE_RLS = 'SET LOCAL ROLE authenticated'
+const ENFORCE_RLS = 'SET LOCAL ROLE app_runtime'
 
 describe('withTenantContext', () => {
   afterAll(async () => {
