@@ -2567,7 +2567,19 @@ describe('Membership.roleId must belong to the same tenant (fix round 3)', () =>
     expect(rows[0].with_check).toMatch(/current_setting\('app\.current_tenant_id'/)
     expect(rows[0].with_check).toMatch(/EXISTS[\s\S]*FROM "Role"[\s\S]*"roleId"/)
     expect(rows[0].with_check).toMatch(/"Role"\."organizationId" = "Membership"\."organizationId"/)
-    expect(rows[0].with_check).not.toMatch(/IS NULL/)
+    // No NULL-org ROLE allowance: a NULL-org platform Role must never satisfy
+    // this predicate, which is the whole point of round 3.
+    //
+    // Narrowed from a blanket `not.toMatch(/IS NULL/)` by Part C
+    // (20260912103749_enforce_foreign_key_tenant_matching), which added a second
+    // conjunct for Membership's OTHER tenant-crossing foreign key, `branchId`.
+    // That column IS nullable — an organization-wide membership with no home
+    // branch — so its conjunct legitimately contains `"branchId" IS NULL`. The
+    // blanket assertion would reject that while claiming to be about Role, so it
+    // is stated precisely instead: the string that must not appear is an
+    // organizationId NULL allowance.
+    expect(rows[0].with_check).not.toMatch(/"organizationId" IS NULL/)
+    expect(rows[0].with_check).toMatch(/"branchId" IS NULL/)
 
     // Membership is still counted as a single-policy table — no RESTRICTIVE
     // policy was added, because USING is already strict here (see the block
