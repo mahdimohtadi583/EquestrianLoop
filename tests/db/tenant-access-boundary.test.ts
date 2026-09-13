@@ -536,7 +536,7 @@ describe('tenant-access boundary', () => {
         'subscription',
       ])
       expect(relationNamesOf('Subscription')).toEqual(['organization'])
-      expect(relationNamesOf('User')).toEqual(['memberships', 'customer', 'staff'])
+      expect(relationNamesOf('User')).toEqual(['memberships', 'customers', 'staff'])
       expect(relationNamesOf('AuditLog')).toEqual([])
       // And `Branch` — the tenant-scoped target — is genuinely reachable from
       // Organization in the schema, which is what made the exploit possible.

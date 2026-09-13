@@ -84,8 +84,10 @@ describe('createCustomerAccount', () => {
     const password = 'correct-password-1'
 
     // A platform User already exists with this email (e.g. created via Task 11's
-    // createStaffAccount) but has never had a Customer profile — Customer.userId is
-    // globally unique, so this is the only legitimate shape of "existing user" reuse.
+    // createStaffAccount) but has never had a Customer profile in this organization.
+    // Customer.userId is unique per organizationId (not globally), so this is one of
+    // the legitimate shapes of "existing user" reuse — see the cross-organization
+    // test below for the other.
     const existingUser = await prisma.user.create({
       data: { email, passwordHash: await hashPassword(password), type: 'STAFF', name: 'Existing Staffer' },
     })
@@ -99,5 +101,60 @@ describe('createCustomerAccount', () => {
       tx.customer.findUniqueOrThrow({ where: { id: result.customerId } })
     )
     expect(customer.userId).toBe(existingUser.id)
+  })
+
+  it('allows the same User to hold a separate Customer profile in a second organization, using their correct password', async () => {
+    const orgA = await prisma.organization.create({
+      data: { name: 'Home Club', slug: `home-club-${Date.now()}` },
+    })
+    const orgB = await prisma.organization.create({
+      data: { name: 'Second Club', slug: `second-club-${Date.now()}` },
+    })
+    const email = `multi-club-${Date.now()}@test.com`
+    const password = 'correct-password-1'
+
+    const first = await createCustomerAccount({
+      organizationId: orgA.id, email, password, firstName: 'Multi', lastName: 'Club',
+    })
+    const second = await createCustomerAccount({
+      organizationId: orgB.id, email, password, firstName: 'Multi', lastName: 'Club',
+    })
+
+    // Same underlying User (the whole point of the cardinality fix), but
+    // otherwise fully independent, organization-scoped Customer profiles.
+    expect(second.userId).toBe(first.userId)
+    expect(second.customerId).not.toBe(first.customerId)
+    expect(second.qrToken).not.toBe(first.qrToken)
+
+    const customerA = await withTenantContext(orgA.id, (tx) =>
+      tx.customer.findUniqueOrThrow({ where: { id: first.customerId } })
+    )
+    const customerB = await withTenantContext(orgB.id, (tx) =>
+      tx.customer.findUniqueOrThrow({ where: { id: second.customerId } })
+    )
+    expect(customerA.organizationId).toBe(orgA.id)
+    expect(customerB.organizationId).toBe(orgB.id)
+    expect(customerA.userId).toBe(customerB.userId)
+
+    // Org A's Customer profile is not reachable under Org B's tenant context,
+    // and vice versa, even though both belong to the same User — RLS/tenant
+    // scoping is keyed on organizationId, never on the shared userId. This
+    // suite's DB connection is the owner role (BYPASSRLS), needed for Tasks
+    // 3-8's sanctioned contextless-rawPrisma pattern, so proving real RLS
+    // enforcement requires downgrading inside the transaction first — same
+    // technique and rationale as tests/server/tenant-context.test.ts.
+    const orgBCustomers = await withTenantContext(orgB.id, async (tx) => {
+      await tx.$executeRawUnsafe('SET LOCAL ROLE app_runtime')
+      return tx.customer.findMany({ where: { userId: first.userId } })
+    })
+    expect(orgBCustomers.map((c) => c.id)).toEqual([second.customerId])
+    expect(orgBCustomers.map((c) => c.id)).not.toContain(first.customerId)
+
+    const orgACustomers = await withTenantContext(orgA.id, async (tx) => {
+      await tx.$executeRawUnsafe('SET LOCAL ROLE app_runtime')
+      return tx.customer.findMany({ where: { userId: first.userId } })
+    })
+    expect(orgACustomers.map((c) => c.id)).toEqual([first.customerId])
+    expect(orgACustomers.map((c) => c.id)).not.toContain(second.customerId)
   })
 })

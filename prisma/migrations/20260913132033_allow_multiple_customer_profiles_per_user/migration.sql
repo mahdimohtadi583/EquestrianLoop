@@ -1,0 +1,42 @@
+-- =============================================================================
+-- Cardinality fix: a User may hold one Customer profile PER ORGANIZATION, not
+-- one Customer profile platform-wide.
+--
+-- THE DEFECT THIS CLOSES
+-- -----------------------
+-- Spec §3 (Identity Model) and §12 (Data Model) both require: "CUSTOMER —
+-- linked to one or more Customer records (one per organization they
+-- patronize — a rider visiting two different stables gets two Customer rows
+-- under one User, since loyalty balances and booking history are
+-- club-specific)" and "Customer — ... — unique(organizationId, userId)" (a
+-- composite constraint, not a single-column one).
+--
+-- Migration 20260911135253_add_customer_staff_schema created BOTH
+-- "Customer_userId_key" (a single-column UNIQUE INDEX on "userId" alone) AND
+-- "Customer_organizationId_userId_key" (the spec-correct composite). The
+-- single-column index was added to satisfy Prisma's schema-validation
+-- requirement for the (incorrectly singular) "User.customer Customer?"
+-- back-relation that existed in the schema at the time — not a deliberate
+-- product decision. Its effect: a User could never hold more than one
+-- Customer row across the ENTIRE PLATFORM, making the spec's own worked
+-- example (a rider signing up at two different stables) impossible — it
+-- fails with a raw unique-constraint violation today.
+--
+-- THE FIX
+-- -------
+-- Drop only "Customer_userId_key". The composite
+-- "Customer_organizationId_userId_key" already exists (created by the same
+-- original migration) and is left completely untouched — it continues to
+-- enforce "at most one Customer row per (organization, user) pair", which is
+-- the spec-correct invariant. Nothing else about this table changes: no RLS
+-- policy touches "userId" uniqueness (Customer's tenant_isolation policy
+-- keys only on "organizationId"), no foreign-key-tenant-matching policy
+-- anywhere references "Customer_userId_key" (they validate via "Customer.id"
+-- + "Customer.organizationId"), and no other index/constraint on this table
+-- is affected.
+--
+-- This is a pure widening: dropping a UNIQUE constraint can never make
+-- previously-valid data invalid, so there is no data-migration risk.
+-- =============================================================================
+
+DROP INDEX "Customer_userId_key";

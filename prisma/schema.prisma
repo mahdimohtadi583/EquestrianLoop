@@ -99,7 +99,7 @@ model User {
   updatedAt    DateTime @updatedAt
 
   memberships Membership[]
-  customer    Customer?
+  customers   Customer[]
   staff       Staff?
 }
 
@@ -232,7 +232,7 @@ model Customer {
   id             String   @id @default(cuid())
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  userId         String   @unique
+  userId         String
   user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   qrToken        String   @unique @default(cuid())
   firstName      String
@@ -247,6 +247,11 @@ model Customer {
   rewardRedemptions RewardRedemption[]
   payments Payment[]
 
+  // A User may hold one Customer profile per organization (spec §3: "a rider
+  // visiting two different stables gets two Customer rows under one User,
+  // since loyalty balances and booking history are club-specific"). This
+  // composite constraint is the only uniqueness on this relationship —
+  // userId is deliberately NOT independently unique.
   @@unique([organizationId, userId])
   @@index([organizationId])
 }

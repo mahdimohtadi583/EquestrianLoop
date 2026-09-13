@@ -39,10 +39,11 @@ export async function createCustomerAccount(input: z.infer<typeof createCustomer
       // attach a brand-new Customer profile (with a live qrToken) to the victim's real
       // account, in an organization of the attacker's choosing — without ever knowing
       // the victim's actual password. Requiring the submitted password to match the
-      // existing account's passwordHash preserves the legitimate case (an existing
-      // platform User — e.g. a staff account from Task 11 — creating their first
-      // Customer profile) while failing closed on everyone else. Customer.userId is
-      // globally @unique, so a User can never hold more than one Customer row at all.
+      // existing account's passwordHash preserves the legitimate cases — an existing
+      // platform User (e.g. a staff account from Task 11) creating a Customer profile,
+      // whether it's their first one or one in a second organization (Customer.userId
+      // is unique per organizationId, not globally — spec §3) — while failing closed
+      // on everyone else.
       const passwordMatches = await verifyPassword(data.password, user.passwordHash)
       if (!passwordMatches) {
         throw new Error('An account with this email already exists.')
