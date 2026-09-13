@@ -483,9 +483,39 @@ describe('the Supabase Data API roles have no access to public (Part B)', () => 
           thrown = error as Error
         }
         expect(thrown, `${role} could still read "${table}"`).toBeDefined()
-        expect(thrown!.message).toMatch(/permission denied/i)
+        // TWO acceptable denial shapes, and which one appears got STRICTER in
+        // Part D. Under Part B alone the roles kept schema-level USAGE on
+        // `public` (granted to the pseudo-role PUBLIC, which
+        // `REVOKE ... FROM anon, authenticated` could not remove), so the table
+        // resolved and Postgres refused on the table grant:
+        //     ERROR: permission denied for table "User"
+        // Part D's `REVOKE USAGE ON SCHEMA public FROM PUBLIC` removes the
+        // schema from their search path entirely, so the name no longer resolves
+        // at all and the refusal arrives one step earlier:
+        //     ERROR 42P01: relation "User" does not exist
+        // Both are hard denials and the second is strictly stronger — the role
+        // cannot even establish that the table exists. Accepting either keeps
+        // this assertion about the security outcome rather than about which
+        // layer of Postgres says no. What is NOT accepted is a successful read.
+        expect(thrown!.message, `${role} on "${table}"`).toMatch(
+          /permission denied|does not exist/i
+        )
       }
     }
+  })
+
+  it('and the denial is now the stronger, schema-level one for every no-RLS table (Part D)', async () => {
+    // Pinned separately so the strengthening above cannot silently regress to
+    // the weaker "permission denied for table" shape — which is what would
+    // happen if anything re-granted `USAGE ON SCHEMA public` to PUBLIC or to
+    // these roles by name. The two-shape tolerance in the previous test exists
+    // to keep it robust; this test is the one that says which shape is current.
+    const rows = await rawPrisma.$queryRawUnsafe<{ rolname: string; usage: boolean }[]>(
+      `SELECT rolname, has_schema_privilege(rolname, 'public', 'USAGE') AS usage
+         FROM pg_roles WHERE rolname IN ('anon','authenticated') ORDER BY rolname`
+    )
+    console.log('[runtime-role-rls] Data API roles, schema public USAGE:', rows)
+    expect(rows.map((r) => r.usage)).toEqual([false, false])
   })
 
   it('future migrations will not silently re-grant to them (default privileges)', async () => {
