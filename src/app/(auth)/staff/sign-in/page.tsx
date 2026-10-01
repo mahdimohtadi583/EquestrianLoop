@@ -25,7 +25,7 @@ export default function StaffSignInPage() {
       setError('Incorrect email or password.')
       return
     }
-    router.push('/admin')
+    router.push('/staff/dashboard')
   }
 
   return (
