@@ -2,6 +2,7 @@ import { prisma } from '@/db/client'
 import { auth } from '@/server/auth/config'
 import { withTenantContext } from '@/server/tenant/context'
 import type { Permission } from '@/config/permissions'
+import type { Session } from 'next-auth'
 
 export async function getSessionUser() {
   const session = await auth()
@@ -9,6 +10,42 @@ export async function getSessionUser() {
   const user = await prisma.user.findUnique({ where: { id: session.user.id } })
   if (!user) return null
   return { id: user.id, type: user.type }
+}
+
+/**
+ * Task 13: Get session or throw if not authenticated.
+ * Used by middleware to check if user is logged in.
+ * Does NOT fetch user from DB — relies only on JWT session (auth()).
+ */
+export async function getSessionOrRedirect() {
+  const session = await auth()
+  if (!session?.user?.id) {
+    throw new Error('Not authenticated: session required')
+  }
+  return session as Session
+}
+
+/**
+ * Task 13: Require STAFF or ADMIN role.
+ * Throws if user type does not allow staff access.
+ * Synchronous — used for quick role checks in middleware or server actions.
+ */
+export function requireStaffRole(userType: string | undefined) {
+  if (!userType || (userType !== 'STAFF' && userType !== 'ADMIN')) {
+    throw new Error('Not authorized: staff session required')
+  }
+}
+
+/**
+ * Task 13: Require CUSTOMER role (exclusive).
+ * Throws if user type is not CUSTOMER.
+ * Staff and admin cannot use customer portal.
+ * Synchronous — used for quick role checks in middleware or server actions.
+ */
+export function requireCustomerRole(userType: string | undefined) {
+  if (!userType || userType !== 'CUSTOMER') {
+    throw new Error('Not authorized: customer session required')
+  }
 }
 
 export async function requirePermission(organizationId: string, permission: Permission) {

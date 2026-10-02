@@ -77,13 +77,20 @@ export default function BookingDetailPage() {
 
   return (
     <div className="space-y-6 p-6">
-      <div>
-        <Link href="/staff/bookings">
-          <Button variant="outline" className="mb-4">← Back to Bookings</Button>
-        </Link>
-        <h1 className="text-3xl font-serif font-bold text-stone-900">
-          Booking: {booking.customer.firstName} {booking.customer.lastName}
-        </h1>
+      <div className="flex items-center justify-between">
+        <div>
+          <Link href="/staff/bookings">
+            <Button variant="outline" className="mb-4">← Back to Bookings</Button>
+          </Link>
+          <h1 className="text-3xl font-serif font-bold text-stone-900">
+            Booking: {booking.customer.firstName} {booking.customer.lastName}
+          </h1>
+        </div>
+        {booking.status !== 'CANCELED' && (
+          <Link href={`/staff/bookings/${booking.id}/edit`}>
+            <Button>Edit</Button>
+          </Link>
+        )}
       </div>
 
       {error && <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">{error}</div>}

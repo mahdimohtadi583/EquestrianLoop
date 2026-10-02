@@ -6,14 +6,16 @@ import { prisma } from '@/db/client'
 
 /**
  * Task 21: Customer Portal Server Actions
+ * Task 25: Booking Management CRUD - Cancel booking
  *
- * Server actions for customers to view their own data:
+ * Server actions for customers to view and manage their own data:
  * 1. getMyBookings - customer's own bookings
  * 2. getMyMembership - current active membership
- * 3. getMyHorses - customer's own horses (through bookings)
+ * 3. getMyCustomerProfile - customer profile
+ * 4. cancelMyBooking - cancel own booking (Task 25)
  *
  * All use getSessionOrRedirect() + requireCustomerRole()
- * All return data directly (no success/error wrapper)
+ * All return data directly (no success/error wrapper) OR { success, error? }
  */
 
 export async function getMyBookings(organizationId: string) {
@@ -112,4 +114,50 @@ export async function getMyCustomerProfile(organizationId: string) {
       },
     })
   )
+}
+
+export async function cancelMyBooking(
+  organizationId: string,
+  bookingId: string,
+  reason?: string
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const session = await getSessionOrRedirect()
+    requireCustomerRole((session.user as any)?.type)
+
+    // Verify customer owns this booking
+    const customer = await withTenantContext(organizationId, (tx) =>
+      tx.customer.findFirst({
+        where: { userId: session.user?.id },
+        select: { id: true },
+      })
+    )
+
+    if (!customer) {
+      return { success: false, error: 'Customer not found' }
+    }
+
+    const booking = await withTenantContext(organizationId, (tx) =>
+      tx.booking.findUnique({
+        where: { id: bookingId },
+        select: { customerId: true },
+      })
+    )
+
+    if (!booking || booking.customerId !== customer.id) {
+      return { success: false, error: 'Booking not found or access denied' }
+    }
+
+    // Cancel the booking
+    await withTenantContext(organizationId, (tx) =>
+      tx.booking.update({
+        where: { id: bookingId },
+        data: { status: 'CANCELED' },
+      })
+    )
+
+    return { success: true }
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Failed to cancel booking' }
+  }
 }

@@ -215,3 +215,45 @@ export async function cancelBooking(
     return { success: false, error: err instanceof Error ? err.message : 'Failed to cancel booking' }
   }
 }
+
+export async function getRidingSessions(organizationId: string) {
+  const session = await getSessionOrRedirect()
+  requireStaffRole((session.user as any)?.type)
+
+  return withTenantContext(organizationId, (tx) =>
+    tx.ridingSession.findMany({
+      where: {
+        startsAt: { gt: new Date() }, // Only future sessions
+      },
+      include: {
+        horse: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+        service: {
+          select: {
+            id: true,
+            name: true,
+            durationMinutes: true,
+          },
+        },
+        trainer: {
+          include: {
+            staff: {
+              include: {
+                user: {
+                  select: {
+                    name: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      orderBy: { startsAt: 'asc' },
+    })
+  )
+}

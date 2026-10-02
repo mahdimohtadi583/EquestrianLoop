@@ -20,11 +20,19 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   ],
   callbacks: {
     async jwt({ token, user }) {
-      if (user) token.sub = user.id
+      if (user) {
+        token.sub = user.id
+        // Store user type in JWT for access in middleware (Task 13)
+        token.type = (user as any).type
+      }
       return token
     },
     async session({ session, token }) {
-      if (token.sub && session.user) session.user.id = token.sub
+      if (token.sub && session.user) {
+        session.user.id = token.sub
+        // Expose user type in session for route guards (Task 13)
+        ;(session.user as any).type = token.type
+      }
       return session
     },
   },
