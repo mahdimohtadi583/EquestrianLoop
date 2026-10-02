@@ -1,5 +1,11 @@
 export const dynamic = 'force-dynamic'
 
-import { handlers } from '@/server/auth/config'
+export async function GET(request: Request) {
+  const { handlers } = await import('@/auth')
+  return handlers.GET(request)
+}
 
-export const { GET, POST } = handlers
+export async function POST(request: Request) {
+  const { handlers } = await import('@/auth')
+  return handlers.POST(request)
+}
