@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "prestart": "ts-node scripts/check-env.ts",
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run"
