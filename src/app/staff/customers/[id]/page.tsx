@@ -3,8 +3,9 @@
 import { useEffect, useState } from 'react'
 import { useSession } from 'next-auth/react'
 import { useParams } from 'next/navigation'
-import { getCustomerById } from '@/server/actions/staff-customers'
+import { getCustomerById, awardLoyaltyPoints } from '@/server/actions/staff-customers'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
 
 interface CustomerDetail {
   id: string
@@ -49,6 +50,8 @@ export default function CustomerDetailPage() {
   const [customer, setCustomer] = useState<CustomerDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [loyaltyPoints, setLoyaltyPoints] = useState('')
+  const [awarding, setAwarding] = useState(false)
 
   useEffect(() => {
     const loadCustomer = async () => {
@@ -195,6 +198,66 @@ export default function CustomerDetailPage() {
           </CardContent>
         </Card>
       )}
+
+      {/* Loyalty Points */}
+      <Card className="border-stone-200">
+        <CardHeader>
+          <CardTitle className="text-lg">Award Loyalty Points</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault()
+              setAwarding(true)
+              try {
+                if (!session?.user || !params.id) throw new Error('Not authenticated')
+                const user = session.user as any
+                const points = parseInt(loyaltyPoints)
+                if (isNaN(points) || points <= 0) {
+                  setError('Enter valid points')
+                  return
+                }
+
+                const result = await awardLoyaltyPoints(
+                  user.organizationId || '',
+                  params.id,
+                  points,
+                  'Staff Award'
+                )
+
+                if (result.success) {
+                  setLoyaltyPoints('')
+                  setError(null)
+                } else {
+                  setError(result.error || 'Failed to award points')
+                }
+              } catch (err) {
+                setError(err instanceof Error ? err.message : 'Failed to award points')
+              } finally {
+                setAwarding(false)
+              }
+            }}
+            className="space-y-4"
+          >
+            <div>
+              <label className="block text-sm font-medium text-stone-700 mb-2">Points to Award</label>
+              <div className="flex gap-2">
+                <input
+                  type="number"
+                  value={loyaltyPoints}
+                  onChange={(e) => setLoyaltyPoints(e.target.value)}
+                  min="1"
+                  className="flex-1 px-3 py-2 border border-stone-300 rounded-md focus:outline-none focus:ring-2 focus:ring-stone-500"
+                  placeholder="Enter points"
+                />
+                <Button type="submit" disabled={awarding}>
+                  {awarding ? 'Awarding...' : 'Award'}
+                </Button>
+              </div>
+            </div>
+          </form>
+        </CardContent>
+      </Card>
     </div>
   )
 }

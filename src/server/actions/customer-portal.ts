@@ -167,3 +167,116 @@ export async function cancelMyBooking(
     return { success: false, error: err instanceof Error ? err.message : 'Failed to cancel booking' }
   }
 }
+
+export async function getLoyaltyBalance(organizationId: string) {
+  const session = await getSessionOrRedirect()
+  requireCustomerRole((session.user as any)?.type)
+
+  const customer = await withTenantContext(organizationId, (tx) =>
+    tx.customer.findFirst({
+      where: { userId: session.user?.id },
+      select: { id: true },
+    })
+  )
+
+  if (!customer) {
+    return null
+  }
+
+  return withTenantContext(organizationId, (tx) =>
+    tx.loyaltyAccount.findUnique({
+      where: { customerId: customer.id },
+      include: {
+        transactions: {
+          orderBy: { createdAt: 'desc' },
+          take: 20,
+        },
+      },
+    })
+  )
+}
+
+export async function redeemReward(
+  organizationId: string,
+  rewardId: string
+): Promise<{ success: boolean; data?: any; error?: string }> {
+  try {
+    const session = await getSessionOrRedirect()
+    requireCustomerRole((session.user as any)?.type)
+
+    // Find customer
+    const customer = await withTenantContext(organizationId, (tx) =>
+      tx.customer.findFirst({
+        where: { userId: session.user?.id },
+        select: { id: true },
+      })
+    )
+
+    if (!customer) {
+      return { success: false, error: 'Customer not found' }
+    }
+
+    // Get reward and loyalty account
+    const [reward, loyalty] = await Promise.all([
+      withTenantContext(organizationId, (tx) =>
+        tx.reward.findUnique({
+          where: { id: rewardId },
+        })
+      ),
+      withTenantContext(organizationId, (tx) =>
+        tx.loyaltyAccount.findUnique({
+          where: { customerId: customer.id },
+        })
+      ),
+    ])
+
+    if (!reward) {
+      return { success: false, error: 'Reward not found' }
+    }
+
+    if (!loyalty) {
+      return { success: false, error: 'Loyalty account not found' }
+    }
+
+    if (loyalty.balance < reward.pointsCost) {
+      return { success: false, error: 'Insufficient points' }
+    }
+
+    // Create transaction and redemption within transaction
+    const result = await withTenantContext(organizationId, (tx) =>
+      tx.$transaction(async (prisma: any) => {
+        const transaction = await prisma.loyaltyTransaction.create({
+          data: {
+            organizationId,
+            loyaltyAccountId: loyalty.id,
+            type: 'REDEMPTION',
+            points: -reward.pointsCost,
+            sourceType: 'REWARD',
+            sourceId: rewardId,
+          },
+        })
+
+        const redemption = await prisma.rewardRedemption.create({
+          data: {
+            organizationId,
+            customerId: customer.id,
+            rewardId,
+            loyaltyTransactionId: transaction.id,
+          },
+        })
+
+        // Update loyalty account balance
+        const updatedLoyalty = await prisma.loyaltyAccount.update({
+          where: { id: loyalty.id },
+          data: { balance: loyalty.balance - reward.pointsCost },
+        })
+
+        return updatedLoyalty
+      })
+    )
+
+    return { success: true, data: result }
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Failed to redeem reward' }
+  }
+}
