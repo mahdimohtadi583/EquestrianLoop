@@ -2,6 +2,7 @@
 
 import { prisma } from '@/db/client'
 import { sendEmail } from '@/server/notifications/notification-service'
+import { rateLimit } from '@/server/rate-limit/rate-limiter'
 import crypto from 'crypto'
 
 /**
@@ -125,6 +126,13 @@ export async function resendVerificationEmail(userId: string): Promise<{
   error?: string
 }> {
   try {
+    // Rate limit: 3 attempts per hour per userId
+    const rateLimitResult = await rateLimit(userId, 3, 3600)
+    if (!rateLimitResult.success) {
+      const minutesRemaining = Math.ceil((rateLimitResult.resetAt.getTime() - Date.now()) / 60000)
+      return { success: false, error: `Too many attempts. Try again in ${minutesRemaining} minutes.` }
+    }
+
     const user = await prisma.user.findUnique({
       where: { id: userId },
     })
@@ -137,8 +145,6 @@ export async function resendVerificationEmail(userId: string): Promise<{
       return { success: false, error: 'Email already verified' }
     }
 
-    // Check if token was recently sent (rate limiting - 3 per hour)
-    // For now, just send - rate limiting will be in Task 32
     return sendVerificationEmail(userId)
   } catch (err) {
     return {

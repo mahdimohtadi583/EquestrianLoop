@@ -3,6 +3,7 @@
 import { prisma } from '@/db/client'
 import { hashPassword, verifyPassword } from '@/server/auth/password'
 import { sendEmail } from '@/server/notifications/notification-service'
+import { rateLimit } from '@/server/rate-limit/rate-limiter'
 import crypto from 'crypto'
 
 /**
@@ -48,6 +49,13 @@ export async function requestPasswordReset(email: string): Promise<{
   error?: string
 }> {
   try {
+    // Rate limit: 3 attempts per hour per email
+    const rateLimitResult = await rateLimit(email, 3, 3600)
+    if (!rateLimitResult.success) {
+      const minutesRemaining = Math.ceil((rateLimitResult.resetAt.getTime() - Date.now()) / 60000)
+      return { success: false, error: `Too many attempts. Try again in ${minutesRemaining} minutes.` }
+    }
+
     const user = await prisma.user.findUnique({
       where: { email },
     })
