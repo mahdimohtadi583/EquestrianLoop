@@ -47,7 +47,9 @@ export default function StaffHorsesPage() {
     <div className="space-y-6 p-6">
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-serif font-bold text-stone-900">Horses</h1>
-        <Button>Add Horse</Button>
+        <Link href="/staff/horses/new">
+          <Button>Add Horse</Button>
+        </Link>
       </div>
 
       {error && <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">{error}</div>}

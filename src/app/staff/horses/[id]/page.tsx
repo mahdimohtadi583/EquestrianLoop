@@ -1,10 +1,12 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import Link from 'next/link'
 import { useSession } from 'next-auth/react'
 import { useParams } from 'next/navigation'
 import { getHorseById } from '@/server/actions/staff-horses'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
 
 interface HorseDetail {
   id: string
@@ -70,9 +72,16 @@ export default function HorseDetailPage() {
 
   return (
     <div className="space-y-6 p-6">
-      <div>
-        <h1 className="text-3xl font-serif font-bold text-stone-900">{horse.name}</h1>
-        <p className="text-stone-600">{horse.breed || 'Breed not specified'}</p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-3xl font-serif font-bold text-stone-900">{horse.name}</h1>
+          <p className="text-stone-600">{horse.breed || 'Breed not specified'}</p>
+        </div>
+        {horse.status !== 'RETIRED' && (
+          <Link href={`/staff/horses/${horse.id}/edit`}>
+            <Button>Edit</Button>
+          </Link>
+        )}
       </div>
 
       {error && <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">{error}</div>}
