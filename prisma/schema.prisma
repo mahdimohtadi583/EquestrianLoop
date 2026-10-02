@@ -89,14 +89,19 @@ enum NotificationChannel {
 }
 
 model User {
-  id           String   @id @default(cuid())
-  email        String   @unique
-  passwordHash String
-  type         UserType
-  name         String
-  phone        String?
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  id                        String   @id @default(cuid())
+  email                     String   @unique
+  passwordHash              String
+  type                      UserType
+  name                      String
+  phone                     String?
+  emailVerified             DateTime?
+  verificationToken         String?  @unique
+  verificationTokenExpiry   DateTime?
+  resetToken                String?  @unique
+  resetTokenExpiry          DateTime?
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
 
   memberships Membership[]
   customers   Customer[]

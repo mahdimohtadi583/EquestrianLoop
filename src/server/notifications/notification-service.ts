@@ -28,7 +28,7 @@ if (!isTest) {
 
 const EMAIL_FROM = process.env.EMAIL_FROM || 'noreply@equestrianloop.com'
 
-async function sendEmail(
+export async function sendEmail(
   to: string,
   subject: string,
   html: string

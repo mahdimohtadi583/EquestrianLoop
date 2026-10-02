@@ -3,6 +3,7 @@
 import { z } from 'zod'
 import { hashPassword, verifyPassword } from '@/server/auth/password'
 import { withTenantContext } from '@/server/tenant/context'
+import { sendVerificationEmail } from '@/server/actions/auth-verification'
 
 const createCustomerAccountSchema = z.object({
   organizationId: z.string(),
@@ -19,7 +20,7 @@ export async function createCustomerAccount(input: z.infer<typeof createCustomer
   // Same reasoning as createStaffAccount (Task 11): User is platform-level but is created
   // inside the same withTenantContext transaction as the tenant-scoped Customer row so both
   // commit atomically, without needing a separate (blocked) prisma.$transaction path.
-  return withTenantContext(data.organizationId, async (tx) => {
+  const result = await withTenantContext(data.organizationId, async (tx) => {
     let user = await tx.user.findUnique({ where: { email: data.email } })
     if (!user) {
       user = await tx.user.create({
@@ -60,4 +61,11 @@ export async function createCustomerAccount(input: z.infer<typeof createCustomer
     })
     return { userId: user.id, customerId: customer.id, qrToken: customer.qrToken }
   })
+
+  // Send verification email (fire-and-forget)
+  sendVerificationEmail(result.userId).catch((err) => {
+    console.error('Failed to send verification email:', err)
+  })
+
+  return result
 }

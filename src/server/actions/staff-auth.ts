@@ -3,6 +3,7 @@
 import { z } from 'zod'
 import { hashPassword } from '@/server/auth/password'
 import { withTenantContext } from '@/server/tenant/context'
+import { sendVerificationEmail } from '@/server/actions/auth-verification'
 
 const createStaffAccountSchema = z.object({
   organizationId: z.string(),
@@ -21,7 +22,7 @@ export async function createStaffAccount(input: z.infer<typeof createStaffAccoun
   // transaction as the tenant-scoped Staff/Membership rows so all three commit atomically —
   // there is no separate prisma.$transaction path available (Task 2 blocks it), and there
   // doesn't need to be: withTenantContext's tx already has every model, User included.
-  return withTenantContext(data.organizationId, async (tx) => {
+  const result = await withTenantContext(data.organizationId, async (tx) => {
     const user = await tx.user.create({
       data: { email: data.email, passwordHash, type: 'STAFF', name: data.name },
     })
@@ -39,4 +40,11 @@ export async function createStaffAccount(input: z.infer<typeof createStaffAccoun
     })
     return { userId: user.id, staffId: staff.id }
   })
+
+  // Send verification email (fire-and-forget)
+  sendVerificationEmail(result.userId).catch((err) => {
+    console.error('Failed to send verification email:', err)
+  })
+
+  return result
 }
