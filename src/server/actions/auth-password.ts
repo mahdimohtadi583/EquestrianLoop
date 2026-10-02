@@ -4,6 +4,7 @@ import { prisma } from '@/db/client'
 import { hashPassword, verifyPassword } from '@/server/auth/password'
 import { sendEmail } from '@/server/notifications/notification-service'
 import { rateLimit } from '@/server/rate-limit/rate-limiter'
+import { logAction } from '@/server/audit/audit-logger'
 import crypto from 'crypto'
 
 /**

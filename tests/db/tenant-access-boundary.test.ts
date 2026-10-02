@@ -428,7 +428,7 @@ describe('tenant-access boundary', () => {
       expect(renamed.name).toBe('Renamed')
 
       const log = await prisma.auditLog.create({
-        data: { actorUserId: 'boundary-test', action: 'E2E', entityType: 'Organization', entityId: org.id },
+        data: { organizationId: org.id, userId: 'boundary-test', action: 'E2E', resource: 'Organization', resourceId: org.id },
       })
       expect(log.id).toBeTruthy()
 

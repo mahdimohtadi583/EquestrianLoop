@@ -175,15 +175,17 @@ model Subscription {
 
 model AuditLog {
   id             String   @id @default(cuid())
-  organizationId String?
-  actorUserId    String
+  organizationId String
+  userId         String?
   action         String
-  entityType     String
-  entityId       String
-  metadata       Json     @default("{}")
+  resource       String
+  resourceId     String?
+  metadata       Json?
+  ipAddress      String?
   createdAt      DateTime @default(now())
 
-  @@index([organizationId])
+  @@index([organizationId, createdAt])
+  @@index([organizationId, action])
 }
 
 model Membership {
