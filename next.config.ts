@@ -1,3 +1,7 @@
+// Provide fallback env vars at build time to prevent module load errors
+process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgresql://build:build@localhost:5432/build'
+process.env.DIRECT_URL = process.env.DIRECT_URL || 'postgresql://build:build@localhost:5432/build'
+
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
