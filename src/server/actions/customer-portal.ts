@@ -3,6 +3,7 @@
 import { getSessionOrRedirect, requireCustomerRole } from '@/server/auth/guards'
 import { withTenantContext } from '@/server/tenant/context'
 import { prisma } from '@/db/client'
+import { sendBookingCancellation } from '@/server/notifications/notification-service'
 
 /**
  * Task 21: Customer Portal Server Actions
@@ -155,6 +156,11 @@ export async function cancelMyBooking(
         data: { status: 'CANCELED' },
       })
     )
+
+    // Send cancellation email (fire and forget)
+    sendBookingCancellation(organizationId, bookingId, reason).catch((err) => {
+      console.error('Failed to send booking cancellation:', err)
+    })
 
     return { success: true }
   } catch (err) {

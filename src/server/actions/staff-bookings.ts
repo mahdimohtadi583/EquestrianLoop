@@ -2,6 +2,7 @@
 
 import { getSessionOrRedirect, requireStaffRole } from '@/server/auth/guards'
 import { withTenantContext } from '@/server/tenant/context'
+import { sendBookingConfirmation, sendBookingCancellation } from '@/server/notifications/notification-service'
 
 /**
  * Task 20: Staff Bookings Server Actions
@@ -164,6 +165,11 @@ export async function createBooking(
       })
     )
 
+    // Send confirmation email (fire and forget - don't block on failure)
+    sendBookingConfirmation(organizationId, booking.id).catch((err) => {
+      console.error('Failed to send booking confirmation:', err)
+    })
+
     return { success: true, data: booking }
   } catch (err) {
     return { success: false, error: err instanceof Error ? err.message : 'Failed to create booking' }
@@ -209,6 +215,11 @@ export async function cancelBooking(
         data: { status: 'CANCELED' },
       })
     )
+
+    // Send cancellation email (fire and forget)
+    sendBookingCancellation(organizationId, bookingId, reason).catch((err) => {
+      console.error('Failed to send booking cancellation:', err)
+    })
 
     return { success: true }
   } catch (err) {
